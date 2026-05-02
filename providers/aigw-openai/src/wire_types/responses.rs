@@ -330,6 +330,11 @@ pub enum TypedResponseToolChoice {
         #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
         extra: JsonObject,
     },
+    #[serde(rename = "web_search")]
+    WebSearch {
+        #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
+        extra: JsonObject,
+    },
     #[serde(rename = "web_search_preview")]
     WebSearchPreview {
         #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]

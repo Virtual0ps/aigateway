@@ -118,6 +118,13 @@ pub struct ResponsesRequestConfig {
     /// `None` means no truncation (public API). The Codex private backend
     /// enforces a 64-character limit.
     pub max_tool_name_len: Option<usize>,
+
+    /// Rewrite legacy `web_search_preview` / `web_search_preview_2025_03_11`
+    /// tool and tool_choice types to `web_search`.
+    ///
+    /// The Codex private backend (`chatgpt.com/backend-api/codex/responses`)
+    /// rejects the old preview names with HTTP 400. Enable this for Codex.
+    pub normalize_builtin_web_search: bool,
 }
 
 impl Default for ResponsesRequestConfig {
@@ -135,6 +142,7 @@ impl Default for ResponsesRequestConfig {
             default_reasoning_effort: None,
             force_instructions: false,
             max_tool_name_len: None,
+            normalize_builtin_web_search: false,
         }
     }
 }
@@ -161,6 +169,7 @@ impl ResponsesRequestConfig {
             default_reasoning_effort: Some("medium".into()),
             force_instructions: true,
             max_tool_name_len: Some(64),
+            normalize_builtin_web_search: true,
         }
     }
 }
@@ -336,12 +345,27 @@ fn chat_request_to_responses(
     };
 
     let tools = req.tools.as_ref().map(|ts| {
-        ts.iter()
+        let mut translated = ts
+            .iter()
             .map(|t| translate_tool(t, config))
-            .collect::<Vec<ResponseTool>>()
+            .collect::<Vec<ResponseTool>>();
+        if config.normalize_builtin_web_search {
+            translated = translated
+                .into_iter()
+                .map(normalize_web_search_tool)
+                .collect();
+        }
+        translated
     });
 
-    let tool_choice = req.tool_choice.as_ref().map(translate_tool_choice);
+    let tool_choice = req.tool_choice.as_ref().map(|tc| {
+        let translated = translate_tool_choice(tc);
+        if config.normalize_builtin_web_search {
+            normalize_web_search_tool_choice(translated)
+        } else {
+            translated
+        }
+    });
 
     // Extract Responses-specific fields from `extra` with config fallbacks.
     let store = req
@@ -563,19 +587,38 @@ fn translate_tool_call(tc: &ToolCall) -> Value {
 }
 
 fn translate_tool(tool: &Tool, config: &ResponsesRequestConfig) -> ResponseTool {
-    let mut name = tool.function.name.clone();
-    if let Some(max_len) = config.max_tool_name_len {
-        name.truncate(max_len);
+    match tool.kind.as_str() {
+        "web_search_preview" => {
+            ResponseTool::Typed(Box::new(TypedResponseTool::WebSearchPreview {
+                search_content_types: None,
+                search_context_size: None,
+                user_location: None,
+                extra: Default::default(),
+            }))
+        }
+        "web_search_preview_2025_03_11" => {
+            ResponseTool::Typed(Box::new(TypedResponseTool::WebSearchPreview20250311 {
+                search_content_types: None,
+                search_context_size: None,
+                user_location: None,
+                extra: Default::default(),
+            }))
+        }
+        _ => {
+            let mut name = tool.function.name.clone();
+            if let Some(max_len) = config.max_tool_name_len {
+                name.truncate(max_len);
+            }
+            ResponseTool::Typed(Box::new(TypedResponseTool::Function {
+                name,
+                description: tool.function.description.clone(),
+                parameters: tool.function.parameters.clone(),
+                strict: tool.function.strict,
+                defer_loading: None,
+                extra: Default::default(),
+            }))
+        }
     }
-
-    ResponseTool::Typed(Box::new(TypedResponseTool::Function {
-        name,
-        description: tool.function.description.clone(),
-        parameters: tool.function.parameters.clone(),
-        strict: tool.function.strict,
-        defer_loading: None,
-        extra: Default::default(),
-    }))
 }
 
 fn translate_tool_choice(tc: &ToolChoice) -> ResponseToolChoice {
@@ -589,6 +632,84 @@ fn translate_tool_choice(tc: &ToolChoice) -> ResponseToolChoice {
             extra: Default::default(),
         }),
         ToolChoice::Raw(obj) => ResponseToolChoice::Raw(obj.clone()),
+    }
+}
+
+/// Normalize legacy `web_search_preview` / `web_search_preview_2025_03_11` tool types
+/// to `web_search` for backends (e.g. Codex) that only accept the canonical name.
+fn normalize_web_search_tool(tool: ResponseTool) -> ResponseTool {
+    match tool {
+        ResponseTool::Typed(inner) => {
+            let normalized = match *inner {
+                TypedResponseTool::WebSearchPreview { extra, .. }
+                | TypedResponseTool::WebSearchPreview20250311 { extra, .. } => {
+                    TypedResponseTool::WebSearch {
+                        filters: None,
+                        search_context_size: None,
+                        user_location: None,
+                        extra,
+                    }
+                }
+                other => other,
+            };
+            ResponseTool::Typed(Box::new(normalized))
+        }
+        other => other,
+    }
+}
+
+/// Normalize legacy `web_search_preview` / `web_search_preview_2025_03_11` tool_choice types
+/// to `web_search` for backends (e.g. Codex) that only accept the canonical name.
+fn normalize_web_search_tool_choice(tc: ResponseToolChoice) -> ResponseToolChoice {
+    match tc {
+        ResponseToolChoice::Typed(inner) => {
+            let normalized = match inner {
+                TypedResponseToolChoice::WebSearchPreview { extra }
+                | TypedResponseToolChoice::WebSearchPreview20250311 { extra } => {
+                    TypedResponseToolChoice::WebSearch { extra }
+                }
+                TypedResponseToolChoice::AllowedTools { mode, tools, extra } => {
+                    TypedResponseToolChoice::AllowedTools {
+                        mode,
+                        tools: tools.into_iter().map(normalize_web_search_tool).collect(),
+                        extra,
+                    }
+                }
+                other => other,
+            };
+            ResponseToolChoice::Typed(normalized)
+        }
+        // Raw JSON objects that carry a legacy type are also normalized.
+        ResponseToolChoice::Raw(mut obj) => {
+            if let Some(t) = obj.get("type").and_then(Value::as_str) {
+                if matches!(t, "web_search_preview" | "web_search_preview_2025_03_11") {
+                    obj.insert("type".into(), Value::String("web_search".into()));
+                } else if t == "allowed_tools" {
+                    // Rewrite nested tools array if present.
+                    if let Some(Value::Array(tools)) = obj.get_mut("tools") {
+                        for tool in tools.iter_mut() {
+                            if let Value::Object(tool_obj) = tool {
+                                if let Some(tool_type) =
+                                    tool_obj.get("type").and_then(Value::as_str)
+                                {
+                                    if matches!(
+                                        tool_type,
+                                        "web_search_preview" | "web_search_preview_2025_03_11"
+                                    ) {
+                                        tool_obj.insert(
+                                            "type".into(),
+                                            Value::String("web_search".into()),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            ResponseToolChoice::Raw(obj)
+        }
+        other => other,
     }
 }
 
@@ -1039,5 +1160,82 @@ mod tests {
         let reasoning = resp.reasoning.unwrap();
         assert_eq!(reasoning["effort"], "medium");
         assert_eq!(reasoning["summary"], "auto");
+    }
+
+    // ── web_search_preview normalization ────────────────────────────────
+
+    fn make_builtin_tool_request(kind: &str) -> ChatRequest {
+        let mut req = minimal_request();
+        req.tools = Some(vec![Tool {
+            kind: kind.into(),
+            function: FunctionDefinition {
+                name: String::new(),
+                description: None,
+                parameters: None,
+                strict: None,
+                extra: Default::default(),
+            },
+            extra: Default::default(),
+        }]);
+        req
+    }
+
+    #[test]
+    fn codex_normalizes_web_search_preview_tool_to_web_search() {
+        let req = make_builtin_tool_request("web_search_preview");
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        let tools = resp.tools.unwrap();
+        let serialized = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(serialized["type"], "web_search");
+    }
+
+    #[test]
+    fn codex_normalizes_web_search_preview_dated_tool_to_web_search() {
+        let req = make_builtin_tool_request("web_search_preview_2025_03_11");
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        let tools = resp.tools.unwrap();
+        let serialized = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(serialized["type"], "web_search");
+    }
+
+    #[test]
+    fn codex_normalizes_web_search_preview_tool_choice_to_web_search() {
+        let mut req = minimal_request();
+        req.tool_choice = Some(ToolChoice::Raw(
+            serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).unwrap(),
+        ));
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        let serialized = serde_json::to_value(&resp.tool_choice.unwrap()).unwrap();
+        assert_eq!(serialized["type"], "web_search");
+    }
+
+    #[test]
+    fn codex_normalizes_allowed_tools_nested_web_search_preview() {
+        let mut req = minimal_request();
+        req.tool_choice = Some(ToolChoice::Raw(
+            serde_json::from_value(serde_json::json!({
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [
+                    {"type": "web_search_preview"},
+                    {"type": "web_search_preview_2025_03_11"}
+                ]
+            }))
+            .unwrap(),
+        ));
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        let serialized = serde_json::to_value(&resp.tool_choice.unwrap()).unwrap();
+        assert_eq!(serialized["type"], "allowed_tools");
+        assert_eq!(serialized["tools"][0]["type"], "web_search");
+        assert_eq!(serialized["tools"][1]["type"], "web_search");
+    }
+
+    #[test]
+    fn default_config_does_not_normalize_web_search_preview_tool() {
+        let req = make_builtin_tool_request("web_search_preview");
+        let resp = chat_request_to_responses(&req, &default_config()).unwrap();
+        let tools = resp.tools.unwrap();
+        let serialized = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(serialized["type"], "web_search_preview");
     }
 }
