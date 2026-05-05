@@ -6,6 +6,8 @@ use serde_json::Value;
 
 use crate::{ForwardCompatible, JsonObject, OneOrMany, json_object_is_empty};
 
+use super::thinking::{ThinkingRequest, ThinkingSource};
+
 // ─── ChatRequest ────────────────────────────────────────────────────────────
 
 /// Canonical chat completion request.
@@ -77,6 +79,14 @@ pub struct ChatRequest {
     /// End-user identifier for abuse detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Canonical extended-thinking / reasoning configuration.
+    ///
+    /// Translators consult this first; if absent, they may fall back to
+    /// legacy `extra["thinking"]` / `extra["reasoning"]` /
+    /// `extra["reasoning_effort"]` keys for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingRequest>,
 
     /// All other fields — provider-specific parameters pass through untouched.
     #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
@@ -201,6 +211,48 @@ pub enum TypedContentPart {
     /// File attachment.
     File {
         file: Value,
+        #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
+        extra: JsonObject,
+    },
+    /// Extended thinking / reasoning content emitted by the model.
+    ///
+    /// Producers: Anthropic (`thinking` block with `signature`), OpenAI
+    /// Responses API (`reasoning` block with `encrypted_content`), Gemini
+    /// (`Part.thought=true` with `thought_signature`).
+    ///
+    /// **Replay rule:** when this part appears on a prior assistant turn,
+    /// downstream translators must forward it back to the same provider on
+    /// the next turn — Anthropic and Gemini both reject silently-modified
+    /// thinking history. The `signature` is opaque and must be preserved
+    /// byte-for-byte. When forwarding to a *different* provider than the one
+    /// that produced the block, translators inspect `source` and either drop
+    /// the block (Anthropic rejects non-Anthropic signatures) or re-emit it
+    /// in the target provider's native shape.
+    Thinking {
+        /// The model's chain-of-thought text. May be empty when the upstream
+        /// provider only emits a signature (some Gemini variants).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thinking: String,
+        /// Opaque integrity signature. Empty = no signature available;
+        /// non-empty = MUST round-trip verbatim.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        signature: String,
+        /// Provider variant flag. Set by the producing translator so
+        /// consumers can apply provider-specific replay rules.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ThinkingSource>,
+        #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
+        extra: JsonObject,
+    },
+    /// Redacted thinking — the upstream model emitted thinking content but
+    /// it has been withheld for safety. Only opaque `data` remains. Must
+    /// still be round-tripped on subsequent turns.
+    RedactedThinking {
+        /// Opaque redacted payload.
+        data: String,
+        /// Provider variant flag (parallel to [`TypedContentPart::Thinking`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ThinkingSource>,
         #[serde(flatten, default, skip_serializing_if = "json_object_is_empty")]
         extra: JsonObject,
     },
@@ -551,5 +603,67 @@ mod tests {
         let msg: Message = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, Role::Tool);
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_abc"));
+    }
+
+    #[test]
+    fn thinking_field_round_trips() {
+        use crate::model::ThinkingLevel;
+
+        let json = r#"{
+            "model": "claude-opus-4-6",
+            "messages": [],
+            "thinking": { "mode": "level", "level": "high" }
+        }"#;
+
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.thinking,
+            Some(ThinkingRequest::Level {
+                level: ThinkingLevel::High
+            })
+        );
+
+        let reserialized = serde_json::to_value(&req).unwrap();
+        assert_eq!(reserialized["thinking"]["mode"], "level");
+        assert_eq!(reserialized["thinking"]["level"], "high");
+    }
+
+    #[test]
+    fn thinking_content_part_round_trips() {
+        use crate::model::ThinkingSource;
+
+        let json = r#"{
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "Let me think...", "signature": "ErWj123", "source": "anthropic" },
+                { "type": "redacted_thinking", "data": "blob", "source": "anthropic" },
+                { "type": "text", "text": "The answer is 42." }
+            ]
+        }"#;
+
+        let msg: Message = serde_json::from_str(json).unwrap();
+        let parts = match msg.content.as_ref().unwrap() {
+            MessageContent::Parts(p) => p,
+            MessageContent::Text(_) => panic!("expected multipart"),
+        };
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Known(TypedContentPart::Thinking { signature, source: Some(ThinkingSource::Anthropic), .. })
+                if signature == "ErWj123"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Known(TypedContentPart::RedactedThinking { data, source: Some(ThinkingSource::Anthropic), .. })
+                if data == "blob"
+        ));
+        assert!(matches!(
+            &parts[2],
+            ContentPart::Known(TypedContentPart::Text { .. })
+        ));
+
+        // Re-serialize and ensure tag is preserved
+        let back = serde_json::to_value(&msg).unwrap();
+        assert_eq!(back["content"][0]["type"], "thinking");
+        assert_eq!(back["content"][1]["type"], "redacted_thinking");
     }
 }

@@ -1,0 +1,254 @@
+//! Canonical extended-thinking / reasoning configuration.
+//!
+//! Different providers expose model thinking under different field names:
+//! Anthropic uses `thinking`, OpenAI Responses uses `reasoning`, OpenAI
+//! Chat Completions uses `reasoning_effort`, and Gemini uses
+//! `generationConfig.thinkingConfig`. This module defines the
+//! provider-neutral form; each provider's [`RequestTranslator`] projects it
+//! onto its native shape via a [`ThinkingProjector`].
+//!
+//! [`RequestTranslator`]: crate::translate::RequestTranslator
+//! [`ThinkingProjector`]: crate::translate::ThinkingProjector
+
+use serde::{Deserialize, Serialize};
+
+/// Canonical extended-thinking / reasoning request.
+///
+/// Translators resolve this onto provider-native fields. When the canonical
+/// field is absent, translators may fall back to legacy `extra["thinking"]` /
+/// `extra["reasoning"]` / `extra["reasoning_effort"]` keys for
+/// backward-compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ThinkingRequest {
+    /// Specific token budget. Level-only providers convert via thresholds.
+    Budget {
+        /// Maximum tokens the model may spend on thinking.
+        budget_tokens: u32,
+    },
+    /// Discrete effort level. Budget-only providers convert via the level table.
+    Level {
+        /// Effort level.
+        level: ThinkingLevel,
+    },
+    /// Let the API decide. Maps to Claude `adaptive`, Gemini `-1`, others: passthrough.
+    Auto,
+    /// Explicitly disabled. Translators must scrub all related native fields.
+    Disabled,
+}
+
+/// Discrete thinking effort levels.
+///
+/// `Minimal`/`Low`/`Medium`/`High` cover the common cross-provider levels.
+/// `XHigh` and `Max` exist for providers (notably Anthropic with very large
+/// budgets) that meaningfully exceed `High`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::AsRefStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Default level→budget mapping (token counts).
+    ///
+    /// Used by providers that need to convert a level into a numeric budget.
+    /// Aligned with upstream `CLIProxyAPI` `convert.go`. Providers may
+    /// override via [`LevelBudgetTable`].
+    #[must_use]
+    pub const fn default_budget(self) -> u32 {
+        match self {
+            Self::Minimal => 512,
+            Self::Low => 1_024,
+            Self::Medium => 8_192,
+            Self::High => 24_576,
+            Self::XHigh => 32_768,
+            Self::Max => 128_000,
+        }
+    }
+
+    /// Default level→discrete-effort mapping (`"low"`/`"medium"`/`"high"`).
+    ///
+    /// Used by providers that take an effort string instead of a budget
+    /// (Codex, Copilot, OpenAI Responses). `XHigh` and `Max` collapse to
+    /// `"high"` since the wire vocabulary stops there.
+    #[must_use]
+    pub const fn default_effort(self) -> &'static str {
+        match self {
+            Self::Minimal | Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High | Self::XHigh | Self::Max => "high",
+        }
+    }
+}
+
+/// Customizable level→budget table.
+///
+/// Defaults match [`ThinkingLevel::default_budget`]. Override per-translator
+/// when a deployment wants different thresholds (e.g. raising `Max` to
+/// 200_000 for an Anthropic preview tier).
+#[derive(Debug, Clone, Copy)]
+pub struct LevelBudgetTable {
+    pub minimal: u32,
+    pub low: u32,
+    pub medium: u32,
+    pub high: u32,
+    pub xhigh: u32,
+    pub max: u32,
+}
+
+impl Default for LevelBudgetTable {
+    fn default() -> Self {
+        Self {
+            minimal: ThinkingLevel::Minimal.default_budget(),
+            low: ThinkingLevel::Low.default_budget(),
+            medium: ThinkingLevel::Medium.default_budget(),
+            high: ThinkingLevel::High.default_budget(),
+            xhigh: ThinkingLevel::XHigh.default_budget(),
+            max: ThinkingLevel::Max.default_budget(),
+        }
+    }
+}
+
+impl LevelBudgetTable {
+    /// Look up the configured budget for `level`.
+    #[must_use]
+    pub const fn budget(&self, level: ThinkingLevel) -> u32 {
+        match level {
+            ThinkingLevel::Minimal => self.minimal,
+            ThinkingLevel::Low => self.low,
+            ThinkingLevel::Medium => self.medium,
+            ThinkingLevel::High => self.high,
+            ThinkingLevel::XHigh => self.xhigh,
+            ThinkingLevel::Max => self.max,
+        }
+    }
+}
+
+/// Origin of a thinking content part.
+///
+/// Set by the translator that produced the part. Consumers (request
+/// translators replaying assistant history) inspect this to decide whether
+/// to forward the block to the provider — Anthropic, for example, rejects
+/// thinking blocks whose `signature` was not generated by Anthropic, so a
+/// Gemini-sourced thinking block must be dropped before forwarding to Claude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingSource {
+    Anthropic,
+    Gemini,
+    OpenaiResponses,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_request_round_trip_budget() {
+        let req = ThinkingRequest::Budget {
+            budget_tokens: 16_384,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["mode"], "budget");
+        assert_eq!(json["budget_tokens"], 16_384);
+        let back: ThinkingRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn thinking_request_round_trip_level() {
+        let req = ThinkingRequest::Level {
+            level: ThinkingLevel::High,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["mode"], "level");
+        assert_eq!(json["level"], "high");
+        let back: ThinkingRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn thinking_request_round_trip_auto_disabled() {
+        for variant in [ThinkingRequest::Auto, ThinkingRequest::Disabled] {
+            let json = serde_json::to_value(&variant).unwrap();
+            let back: ThinkingRequest = serde_json::from_value(json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn level_default_budget_matches_upstream_table() {
+        assert_eq!(ThinkingLevel::Minimal.default_budget(), 512);
+        assert_eq!(ThinkingLevel::Low.default_budget(), 1_024);
+        assert_eq!(ThinkingLevel::Medium.default_budget(), 8_192);
+        assert_eq!(ThinkingLevel::High.default_budget(), 24_576);
+        assert_eq!(ThinkingLevel::XHigh.default_budget(), 32_768);
+        assert_eq!(ThinkingLevel::Max.default_budget(), 128_000);
+    }
+
+    #[test]
+    fn level_default_effort_collapses_above_high() {
+        assert_eq!(ThinkingLevel::Minimal.default_effort(), "low");
+        assert_eq!(ThinkingLevel::Low.default_effort(), "low");
+        assert_eq!(ThinkingLevel::Medium.default_effort(), "medium");
+        assert_eq!(ThinkingLevel::High.default_effort(), "high");
+        assert_eq!(ThinkingLevel::XHigh.default_effort(), "high");
+        assert_eq!(ThinkingLevel::Max.default_effort(), "high");
+    }
+
+    #[test]
+    fn level_budget_table_default_matches_per_level_consts() {
+        let table = LevelBudgetTable::default();
+        for level in [
+            ThinkingLevel::Minimal,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::XHigh,
+            ThinkingLevel::Max,
+        ] {
+            assert_eq!(table.budget(level), level.default_budget());
+        }
+    }
+
+    #[test]
+    fn level_budget_table_override() {
+        let table = LevelBudgetTable {
+            max: 200_000,
+            ..LevelBudgetTable::default()
+        };
+        assert_eq!(table.budget(ThinkingLevel::Max), 200_000);
+        assert_eq!(table.budget(ThinkingLevel::High), 24_576);
+    }
+
+    #[test]
+    fn thinking_source_round_trip() {
+        for src in [
+            ThinkingSource::Anthropic,
+            ThinkingSource::Gemini,
+            ThinkingSource::OpenaiResponses,
+        ] {
+            let json = serde_json::to_value(src).unwrap();
+            let back: ThinkingSource = serde_json::from_value(json).unwrap();
+            assert_eq!(back, src);
+        }
+    }
+}

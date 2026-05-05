@@ -11,6 +11,7 @@
 //! pair.
 
 use super::response::{FinishReason, Usage};
+use super::thinking::ThinkingSource;
 
 /// A canonical streaming event.
 ///
@@ -36,12 +37,35 @@ pub enum StreamEvent {
     /// Incremental text content.
     ContentDelta(String),
 
+    /// A new reasoning / thinking block begins.
+    ///
+    /// `index` lets multi-block reasoning (rare but Anthropic-supported) be
+    /// tracked separately when assembling [`TypedContentPart::Thinking`]
+    /// parts on the consumer side.
+    ///
+    /// [`TypedContentPart::Thinking`]: crate::model::TypedContentPart::Thinking
+    ReasoningStart {
+        index: u32,
+        source: Option<ThinkingSource>,
+    },
+
     /// Incremental reasoning/thinking summary text (e.g. from reasoning models
     /// like o3, o4-mini via the Responses API `response.reasoning_summary_text.delta`).
     ReasoningDelta(String),
 
-    /// Opaque reasoning signature emitted when a reasoning block finalizes.
-    /// Must be preserved exactly for subsequent turns.
+    /// A reasoning block finalizes. Carries the integrity signature.
+    ///
+    /// Consumers assemble the accumulated `ReasoningDelta`s + this signature
+    /// into a [`TypedContentPart::Thinking`].
+    ///
+    /// [`TypedContentPart::Thinking`]: crate::model::TypedContentPart::Thinking
+    ReasoningEnd { index: u32, signature: String },
+
+    /// Opaque reasoning signature.
+    ///
+    /// Deprecated in favor of [`StreamEvent::ReasoningEnd`], which also
+    /// carries the block index. Kept for parsers that haven't migrated yet.
+    #[deprecated(since = "0.5.0", note = "use ReasoningEnd { index, signature } instead")]
     ReasoningSignature(String),
 
     /// A new tool call begins.

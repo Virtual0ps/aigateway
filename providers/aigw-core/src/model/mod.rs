@@ -11,7 +11,9 @@
 mod request;
 mod response;
 mod stream;
+mod thinking;
 
 pub use request::*;
 pub use response::*;
 pub use stream::*;
+pub use thinking::*;

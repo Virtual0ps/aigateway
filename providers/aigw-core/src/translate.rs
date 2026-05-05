@@ -35,7 +35,7 @@ use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode};
 
 use crate::error::{ProviderError, TranslateError};
-use crate::model::{ChatRequest, ChatResponse, StreamEvent};
+use crate::model::{ChatRequest, ChatResponse, StreamEvent, ThinkingRequest};
 
 // ─── TranslatedRequest ──────────────────────────────────────────────────────
 
@@ -193,5 +193,68 @@ where
 {
     pub fn new(request: Req, response: Res) -> Self {
         Self { request, response }
+    }
+}
+
+// ─── ThinkingProjector ──────────────────────────────────────────────────────
+
+/// Projects a canonical [`ThinkingRequest`] onto provider-native mutable state.
+///
+/// Each provider crate exposes its own `Target` type — a small struct holding
+/// the subset of the native request body that thinking touches (e.g. for
+/// Anthropic: `thinking`, `max_tokens`, `output_config`). The provider's
+/// [`RequestTranslator`] constructs a `Target`, hands it to the projector,
+/// then unpacks the mutated `Target` into the native request being built.
+///
+/// # Why a separate trait
+///
+/// The mapping rules are non-trivial (capability-dependent dispatch,
+/// budget-vs-level conversion, max_tokens headroom for Anthropic, etc.) and
+/// users may want to override them — different deployments tune the
+/// `level → budget` table or the "is this an adaptive model" predicate. A
+/// separate trait makes that override pluggable without touching the
+/// translator.
+///
+/// # Object safety
+///
+/// The trait is **object-safe**: `Target` is a generic on the trait itself
+/// (concrete at every `dyn` site), and `apply` has no method-level generics
+/// and no `Self` in return position. Translators hold
+/// `Box<dyn ThinkingProjector<TheirTarget>>` so users can swap projectors at
+/// runtime.
+pub trait ThinkingProjector<Target>: Send + Sync {
+    /// Mutate `target` according to the canonical request.
+    ///
+    /// When `req` is `None`, projectors typically leave `target` untouched
+    /// (the translator falls back to whatever it has — usually legacy
+    /// `extra["thinking"]` passthrough).
+    ///
+    /// `model` is the request's model identifier; projectors inspect it to
+    /// decide capability-dependent details (Claude 4.6 adaptive vs. legacy,
+    /// Gemini 3 levels vs. Gemini 2.5 budget, etc.).
+    fn apply(&self, model: &str, req: Option<&ThinkingRequest>, target: &mut Target);
+}
+
+#[cfg(test)]
+mod thinking_projector_tests {
+    use super::*;
+
+    /// Compile-time assertion that the trait is object-safe.
+    #[allow(dead_code)]
+    fn assert_object_safe(_: Box<dyn ThinkingProjector<()>>) {}
+
+    struct NoopProjector;
+    impl ThinkingProjector<u32> for NoopProjector {
+        fn apply(&self, _model: &str, _req: Option<&ThinkingRequest>, target: &mut u32) {
+            *target = 42;
+        }
+    }
+
+    #[test]
+    fn dyn_dispatch_works() {
+        let p: Box<dyn ThinkingProjector<u32>> = Box::new(NoopProjector);
+        let mut target = 0u32;
+        p.apply("any-model", None, &mut target);
+        assert_eq!(target, 42);
     }
 }
