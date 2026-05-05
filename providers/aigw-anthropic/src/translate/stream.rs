@@ -5,12 +5,36 @@
 //! input_tokens (from message_start) with output_tokens (from message_delta).
 
 use aigw_core::error::TranslateError;
-use aigw_core::model::{StreamEvent as CanonicalStreamEvent, Usage};
+use aigw_core::model::{StreamEvent as CanonicalStreamEvent, ThinkingSource, Usage};
 use aigw_core::translate::StreamParser;
 
 use crate::types::{
     ContentBlock, ContentDelta, StreamEvent as AnthropicStreamEvent, TypedContentBlock,
 };
+
+/// What kind of content block is currently open in the Anthropic SSE
+/// stream, so the parser knows how to interpret deltas and stop events.
+#[derive(Debug, Clone)]
+enum OpenBlock {
+    /// No block is currently open (between blocks, or before the first).
+    None,
+    /// Text block (no extra state needed).
+    Text,
+    /// Tool use block — the canonical tool_call index has already been
+    /// emitted via `ToolCallStart`.
+    ToolUse,
+    /// Thinking block — accumulating signature deltas to emit as
+    /// `ReasoningEnd { signature }` on close.
+    Thinking {
+        canonical_index: u32,
+        signature_buf: String,
+    },
+    /// Redacted thinking — currently not surfaced as canonical stream
+    /// events. TODO(aigw): emit a dedicated canonical event once
+    /// `StreamEvent` has a `ReasoningRedacted { index, data }` variant;
+    /// non-streaming responses already round-trip redacted blocks.
+    RedactedThinking,
+}
 
 /// Stateful parser for Anthropic SSE streams.
 ///
@@ -18,6 +42,11 @@ use crate::types::{
 pub struct AnthropicStreamParser {
     /// Incremented on each `content_block_start` with `tool_use` type.
     tool_call_index: u32,
+    /// Incremented on each `content_block_start` with `thinking` type.
+    reasoning_index: u32,
+    /// Currently-open block kind (set on `content_block_start`, cleared on
+    /// `content_block_stop`).
+    open_block: OpenBlock,
     /// Input token count from `message_start`.
     input_tokens: Option<u64>,
     /// Whether `Done` has been emitted.
@@ -34,6 +63,8 @@ impl AnthropicStreamParser {
     pub fn new() -> Self {
         Self {
             tool_call_index: 0,
+            reasoning_index: 0,
+            open_block: OpenBlock::None,
             input_tokens: None,
             done: false,
         }
@@ -65,14 +96,40 @@ impl StreamParser for AnthropicStreamParser {
                     ContentBlock::Typed(TypedContentBlock::ToolUse { id, name, .. }) => {
                         let idx = self.tool_call_index;
                         self.tool_call_index += 1;
+                        self.open_block = OpenBlock::ToolUse;
                         Ok(vec![CanonicalStreamEvent::ToolCallStart {
                             index: idx,
                             id: id.clone(),
                             name: name.clone(),
                         }])
                     }
-                    // Text block start, Thinking, etc: no output.
-                    _ => Ok(vec![]),
+                    ContentBlock::Typed(TypedContentBlock::Thinking { .. }) => {
+                        let idx = self.reasoning_index;
+                        self.reasoning_index += 1;
+                        self.open_block = OpenBlock::Thinking {
+                            canonical_index: idx,
+                            signature_buf: String::new(),
+                        };
+                        Ok(vec![CanonicalStreamEvent::ReasoningStart {
+                            index: idx,
+                            source: Some(ThinkingSource::Anthropic),
+                        }])
+                    }
+                    ContentBlock::Typed(TypedContentBlock::RedactedThinking { .. }) => {
+                        // TODO(aigw): emit ReasoningRedacted { index, data }
+                        // once that variant exists. For now skip in streaming;
+                        // non-streaming responses still surface the block.
+                        self.open_block = OpenBlock::RedactedThinking;
+                        Ok(vec![])
+                    }
+                    ContentBlock::Typed(TypedContentBlock::Text { .. }) => {
+                        self.open_block = OpenBlock::Text;
+                        Ok(vec![])
+                    }
+                    _ => {
+                        self.open_block = OpenBlock::None;
+                        Ok(vec![])
+                    }
                 }
             }
 
@@ -87,11 +144,37 @@ impl StreamParser for AnthropicStreamParser {
                         arguments: partial_json,
                     }])
                 }
-                // ThinkingDelta, SignatureDelta, Unknown: skip.
+                ContentDelta::ThinkingDelta { thinking } => {
+                    Ok(vec![CanonicalStreamEvent::ReasoningDelta(thinking)])
+                }
+                ContentDelta::SignatureDelta { signature } => {
+                    if let OpenBlock::Thinking { signature_buf, .. } = &mut self.open_block {
+                        signature_buf.push_str(&signature);
+                    }
+                    // Anthropic accumulates the signature server-side and
+                    // emits it as one or more deltas; we surface it only at
+                    // block close via `ReasoningEnd`.
+                    Ok(vec![])
+                }
+                // Unknown: skip.
                 _ => Ok(vec![]),
             },
 
-            AnthropicStreamEvent::ContentBlockStop { .. } => Ok(vec![]),
+            AnthropicStreamEvent::ContentBlockStop { .. } => {
+                let prev = std::mem::replace(&mut self.open_block, OpenBlock::None);
+                if let OpenBlock::Thinking {
+                    canonical_index,
+                    signature_buf,
+                } = prev
+                {
+                    Ok(vec![CanonicalStreamEvent::ReasoningEnd {
+                        index: canonical_index,
+                        signature: signature_buf,
+                    }])
+                } else {
+                    Ok(vec![])
+                }
+            }
 
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
                 let mut events = Vec::new();
@@ -314,6 +397,119 @@ mod tests {
         // Second call: no duplicate.
         let events = p.finish().unwrap();
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn thinking_block_streams_reasoning_events() {
+        let mut p = parser();
+
+        // open thinking block
+        let start = r#"{
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "thinking", "thinking": "", "signature": "" }
+        }"#;
+        let events = p.parse_event("content_block_start", start).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            CanonicalStreamEvent::ReasoningStart { index: 0, source: Some(ThinkingSource::Anthropic) }
+        ));
+
+        // thinking_delta → ReasoningDelta
+        let d1 = r#"{
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "Let me " }
+        }"#;
+        let events = p.parse_event("content_block_delta", d1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            CanonicalStreamEvent::ReasoningDelta(s) if s == "Let me "
+        ));
+
+        let d2 = r#"{
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "thinking_delta", "thinking": "think." }
+        }"#;
+        let events = p.parse_event("content_block_delta", d2).unwrap();
+        assert!(matches!(
+            &events[0],
+            CanonicalStreamEvent::ReasoningDelta(s) if s == "think."
+        ));
+
+        // signature_delta is buffered, no output yet
+        let sig = r#"{
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "signature_delta", "signature": "ErWj" }
+        }"#;
+        let events = p.parse_event("content_block_delta", sig).unwrap();
+        assert!(events.is_empty(), "signature_delta is buffered");
+
+        let sig2 = r#"{
+            "type": "content_block_delta", "index": 0,
+            "delta": { "type": "signature_delta", "signature": "Kl123" }
+        }"#;
+        let events = p.parse_event("content_block_delta", sig2).unwrap();
+        assert!(events.is_empty());
+
+        // content_block_stop emits ReasoningEnd with concatenated signature
+        let stop = r#"{ "type": "content_block_stop", "index": 0 }"#;
+        let events = p.parse_event("content_block_stop", stop).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            CanonicalStreamEvent::ReasoningEnd { index: 0, signature } if signature == "ErWjKl123"
+        ));
+    }
+
+    #[test]
+    fn thinking_then_text_uses_separate_indices() {
+        let mut p = parser();
+
+        // First a thinking block
+        let s1 = r#"{
+            "type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":"","signature":""}
+        }"#;
+        let e = p.parse_event("", s1).unwrap();
+        assert!(matches!(
+            e[0],
+            CanonicalStreamEvent::ReasoningStart { index: 0, .. }
+        ));
+
+        let stop1 = r#"{"type":"content_block_stop","index":0}"#;
+        let e = p.parse_event("", stop1).unwrap();
+        assert!(matches!(
+            e[0],
+            CanonicalStreamEvent::ReasoningEnd { index: 0, .. }
+        ));
+
+        // Now a tool_use block — should start at tool_call_index 0 (separate counter)
+        let s2 = r#"{
+            "type":"content_block_start","index":1,
+            "content_block":{"type":"tool_use","id":"t1","name":"fn","input":{}}
+        }"#;
+        let e = p.parse_event("", s2).unwrap();
+        assert!(matches!(
+            e[0],
+            CanonicalStreamEvent::ToolCallStart { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn redacted_thinking_skipped_in_stream() {
+        let mut p = parser();
+        let start = r#"{
+            "type":"content_block_start","index":0,
+            "content_block":{"type":"redacted_thinking","data":"blob"}
+        }"#;
+        let e = p.parse_event("", start).unwrap();
+        assert!(e.is_empty(), "redacted_thinking is currently skipped in stream");
+
+        let stop = r#"{"type":"content_block_stop","index":0}"#;
+        let e = p.parse_event("", stop).unwrap();
+        assert!(e.is_empty(), "stop without thinking emits nothing");
     }
 
     #[test]

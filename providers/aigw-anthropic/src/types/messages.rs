@@ -309,11 +309,18 @@ pub enum ToolChoice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingConfig {
-    /// Enable extended thinking with a token budget.
+    /// Enable extended thinking with a token budget. Required for Claude
+    /// models that don't support adaptive thinking (Claude 4.5 and earlier).
     Enabled {
         /// Maximum tokens the model may spend on thinking.
         budget_tokens: u64,
     },
+    /// Adaptive thinking — let the model dynamically allocate thinking tokens.
+    ///
+    /// Available on Claude 4.6+. Pair with the request-root `output_config`
+    /// field (sibling of `thinking`) to bias the dynamic allocation, e.g.
+    /// `output_config: { effort: "high" }`.
+    Adaptive,
     /// Disable extended thinking.
     Disabled,
 }

@@ -10,11 +10,13 @@
 pub mod request;
 pub mod response;
 pub mod stream;
+pub mod thinking;
 pub mod tools;
 
 pub use request::AnthropicRequestTranslator;
 pub use response::AnthropicResponseTranslator;
 pub use stream::AnthropicStreamParser;
+pub use thinking::{AnthropicThinkingProjector, AnthropicThinkingTarget};
 
 use crate::types::StopReason;
 use aigw_core::model::FinishReason;

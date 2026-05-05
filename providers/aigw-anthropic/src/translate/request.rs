@@ -7,8 +7,10 @@
 //! - Tool call arguments (JSON string) parsed into JSON objects
 
 use aigw_core::error::TranslateError;
-use aigw_core::model::{ChatRequest, ContentPart, Message, MessageContent, Role, TypedContentPart};
-use aigw_core::translate::{RequestTranslator, TranslatedRequest};
+use aigw_core::model::{
+    ChatRequest, ContentPart, Message, MessageContent, Role, ThinkingSource, TypedContentPart,
+};
+use aigw_core::translate::{RequestTranslator, ThinkingProjector, TranslatedRequest};
 use bytes::Bytes;
 use http::{HeaderMap, Method};
 
@@ -17,6 +19,7 @@ use crate::types::{
     MessagesRequest, Metadata, Role as AnthropicRole, SystemPrompt, TypedContentBlock,
 };
 
+use super::thinking::{AnthropicThinkingProjector, AnthropicThinkingTarget};
 use super::tools;
 
 const DEFAULT_MAX_TOKENS: u64 = 4096;
@@ -26,6 +29,7 @@ pub struct AnthropicRequestTranslator {
     headers: HeaderMap,
     url: String,
     default_max_tokens: u64,
+    thinking: Box<dyn ThinkingProjector<AnthropicThinkingTarget>>,
 }
 
 impl AnthropicRequestTranslator {
@@ -34,7 +38,21 @@ impl AnthropicRequestTranslator {
             headers: transport.headers().clone(),
             url: transport.url("/v1/messages"),
             default_max_tokens: default_max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            thinking: Box::new(AnthropicThinkingProjector::default()),
         }
+    }
+
+    /// Replace the thinking projector. Use with a custom
+    /// [`AnthropicThinkingProjector`] (different adaptive-model matcher,
+    /// level→budget table, etc.) or any other implementation of
+    /// [`ThinkingProjector<AnthropicThinkingTarget>`].
+    #[must_use]
+    pub fn with_thinking_projector(
+        mut self,
+        projector: Box<dyn ThinkingProjector<AnthropicThinkingTarget>>,
+    ) -> Self {
+        self.thinking = projector;
+        self
     }
 }
 
@@ -59,15 +77,37 @@ impl RequestTranslator for AnthropicRequestTranslator {
             extra.insert(k.clone(), v.clone());
         }
 
-        // Extract `thinking` from extra if present.
-        let thinking = extra
-            .remove("thinking")
-            .and_then(|v| serde_json::from_value(v).ok());
+        // Resolve thinking config:
+        // 1. Canonical `req.thinking` (preferred) → projector → target.
+        // 2. Legacy fallback: `extra["thinking"]` (deprecated, will be
+        //    removed in 0.6.0). Only consulted when canonical is absent.
+        let mut target = AnthropicThinkingTarget {
+            max_tokens: req.max_tokens.unwrap_or(self.default_max_tokens),
+            ..Default::default()
+        };
+        if req.thinking.is_some() {
+            self.thinking
+                .apply(&req.model, req.thinking.as_ref(), &mut target);
+            // Canonical took precedence — drop any extra-passthrough key.
+            extra.remove("thinking");
+        } else if let Some(legacy) = extra.remove("thinking") {
+            target.thinking = serde_json::from_value(legacy).ok();
+        }
+
+        // Apply output_config decisions from the projector.
+        if let Some(effort) = target.output_config_effort {
+            extra.insert(
+                "output_config".into(),
+                serde_json::json!({ "effort": effort }),
+            );
+        } else if target.clear_output_config {
+            extra.remove("output_config");
+        }
 
         let native = MessagesRequest::builder()
             .model(&req.model)
             .messages(messages)
-            .max_tokens(req.max_tokens.unwrap_or(self.default_max_tokens))
+            .max_tokens(target.max_tokens)
             .maybe_system(system)
             .maybe_temperature(req.temperature)
             .maybe_top_p(req.top_p)
@@ -78,7 +118,7 @@ impl RequestTranslator for AnthropicRequestTranslator {
             .maybe_metadata(req.user.as_ref().map(|u| Metadata {
                 user_id: Some(u.clone()),
             }))
-            .maybe_thinking(thinking)
+            .maybe_thinking(target.thinking)
             .extra(extra)
             .build();
 
@@ -184,8 +224,13 @@ fn translate_user_message(msg: &Message) -> Result<AnthropicMessage, TranslateEr
     let content = match &msg.content {
         Some(MessageContent::Text(s)) => AnthropicContent::Text(s.clone()),
         Some(MessageContent::Parts(parts)) => {
-            let blocks: Result<Vec<_>, _> = parts.iter().map(translate_content_part).collect();
-            AnthropicContent::Blocks(blocks?)
+            let mut blocks = Vec::with_capacity(parts.len());
+            for part in parts {
+                if let Some(block) = translate_content_part(part)? {
+                    blocks.push(block);
+                }
+            }
+            AnthropicContent::Blocks(blocks)
         }
         None => AnthropicContent::Text(String::new()),
     };
@@ -209,7 +254,9 @@ fn translate_assistant_message(msg: &Message) -> Result<AnthropicMessage, Transl
         }
         Some(MessageContent::Parts(parts)) => {
             for part in parts {
-                blocks.push(translate_content_part(part)?);
+                if let Some(block) = translate_content_part(part)? {
+                    blocks.push(block);
+                }
             }
         }
         _ => {}
@@ -265,29 +312,62 @@ fn translate_tool_result(msg: &Message) -> Result<ContentBlock, TranslateError> 
     }))
 }
 
-fn translate_content_part(part: &ContentPart) -> Result<ContentBlock, TranslateError> {
+/// Translate a single canonical content part into an Anthropic content block.
+///
+/// Returns `Ok(Some(_))` for parts that should appear in the wire request,
+/// `Ok(None)` for parts that should be silently dropped (e.g. thinking
+/// blocks generated by a different provider — Anthropic rejects signatures
+/// it didn't produce).
+fn translate_content_part(part: &ContentPart) -> Result<Option<ContentBlock>, TranslateError> {
     match part {
         ContentPart::Known(TypedContentPart::Text { text, .. }) => {
-            Ok(ContentBlock::Typed(TypedContentBlock::Text {
+            Ok(Some(ContentBlock::Typed(TypedContentBlock::Text {
                 text: text.clone(),
                 cache_control: None,
-            }))
+            })))
         }
         ContentPart::Known(TypedContentPart::ImageUrl { image_url, .. }) => {
             let source = translate_image_source(&image_url.url)?;
-            Ok(ContentBlock::Typed(TypedContentBlock::Image {
+            Ok(Some(ContentBlock::Typed(TypedContentBlock::Image {
                 source,
                 cache_control: None,
+            })))
+        }
+        ContentPart::Known(TypedContentPart::Thinking {
+            thinking,
+            signature,
+            source,
+            ..
+        }) => Ok(forward_thinking_to_anthropic(*source).then(|| {
+            ContentBlock::Typed(TypedContentBlock::Thinking {
+                thinking: thinking.clone(),
+                signature: signature.clone(),
+            })
+        })),
+        ContentPart::Known(TypedContentPart::RedactedThinking { data, source, .. }) => {
+            Ok(forward_thinking_to_anthropic(*source).then(|| {
+                ContentBlock::Typed(TypedContentBlock::RedactedThinking { data: data.clone() })
             }))
         }
         ContentPart::Raw(obj) => {
             // Both sides are now serde_json::Map — direct clone.
-            Ok(ContentBlock::Raw(obj.clone()))
+            Ok(Some(ContentBlock::Raw(obj.clone())))
         }
         _ => Err(TranslateError::IncompatibleContent {
             reason: "unsupported content part type for Anthropic".into(),
         }),
     }
+}
+
+/// Returns `true` if a thinking block with the given source should be
+/// forwarded to Anthropic.
+///
+/// Anthropic rejects thinking blocks whose signature it did not produce, so
+/// blocks tagged as having come from another provider must be dropped before
+/// forwarding. Untagged blocks (`source == None`) are forwarded for
+/// backward compatibility — pre-source-tagging clients still work.
+const fn forward_thinking_to_anthropic(source: Option<ThinkingSource>) -> bool {
+    matches!(source, None | Some(ThinkingSource::Anthropic))
 }
 
 fn translate_image_source(url: &str) -> Result<ImageSource, TranslateError> {
@@ -510,6 +590,225 @@ mod tests {
             }
             _ => panic!("expected Blocks"),
         }
+    }
+
+    #[test]
+    fn anthropic_thinking_part_round_trips_to_native() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Known(TypedContentPart::Thinking {
+                    thinking: "Let me think...".into(),
+                    signature: "ErWj123".into(),
+                    source: Some(ThinkingSource::Anthropic),
+                    extra: Default::default(),
+                }),
+                ContentPart::Known(TypedContentPart::Text {
+                    text: "Answer is 42.".into(),
+                    extra: Default::default(),
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            extra: Default::default(),
+        };
+
+        let result = translate_assistant_message(&msg).unwrap();
+        match &result.content {
+            AnthropicContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(
+                    &blocks[0],
+                    ContentBlock::Typed(TypedContentBlock::Thinking { signature, .. })
+                        if signature == "ErWj123"
+                ));
+                assert!(matches!(
+                    &blocks[1],
+                    ContentBlock::Typed(TypedContentBlock::Text { .. })
+                ));
+            }
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn gemini_sourced_thinking_part_is_dropped() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some(MessageContent::Parts(vec![
+                ContentPart::Known(TypedContentPart::Thinking {
+                    thinking: "from gemini".into(),
+                    signature: "garbage".into(),
+                    source: Some(ThinkingSource::Gemini),
+                    extra: Default::default(),
+                }),
+                ContentPart::Known(TypedContentPart::Text {
+                    text: "kept".into(),
+                    extra: Default::default(),
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            extra: Default::default(),
+        };
+
+        let result = translate_assistant_message(&msg).unwrap();
+        match &result.content {
+            AnthropicContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1, "gemini-sourced thinking must be dropped");
+                assert!(matches!(
+                    &blocks[0],
+                    ContentBlock::Typed(TypedContentBlock::Text { text, .. }) if text == "kept"
+                ));
+            }
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn untagged_thinking_part_is_forwarded() {
+        // No `source`: assume legacy producer, forward by default.
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some(MessageContent::Parts(vec![ContentPart::Known(
+                TypedContentPart::Thinking {
+                    thinking: "no source".into(),
+                    signature: "Ezzz".into(),
+                    source: None,
+                    extra: Default::default(),
+                },
+            )])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            extra: Default::default(),
+        };
+
+        let result = translate_assistant_message(&msg).unwrap();
+        match &result.content {
+            AnthropicContent::Blocks(blocks) => assert_eq!(blocks.len(), 1),
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn redacted_thinking_anthropic_source_forwarded() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: Some(MessageContent::Parts(vec![ContentPart::Known(
+                TypedContentPart::RedactedThinking {
+                    data: "blob".into(),
+                    source: Some(ThinkingSource::Anthropic),
+                    extra: Default::default(),
+                },
+            )])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            extra: Default::default(),
+        };
+
+        let result = translate_assistant_message(&msg).unwrap();
+        match &result.content {
+            AnthropicContent::Blocks(blocks) => {
+                assert!(matches!(
+                    &blocks[0],
+                    ContentBlock::Typed(TypedContentBlock::RedactedThinking { data })
+                        if data == "blob"
+                ));
+            }
+            _ => panic!("expected Blocks"),
+        }
+    }
+
+    #[test]
+    fn canonical_thinking_field_invokes_projector() {
+        // ChatRequest.thinking = Level::High on adaptive model →
+        // thinking: {type:"adaptive"} + extra.output_config.effort = "high".
+        use aigw_core::model::{ThinkingLevel, ThinkingRequest};
+
+        let transport = crate::Transport::new(crate::TransportConfig {
+            api_key: secrecy::SecretString::from("sk-ant-test"),
+            ..Default::default()
+        })
+        .unwrap();
+        let translator = AnthropicRequestTranslator::new(&transport, None);
+
+        let req = ChatRequest::builder()
+            .model("claude-opus-4-6")
+            .messages(vec![user_msg("hi")])
+            .thinking(ThinkingRequest::Level {
+                level: ThinkingLevel::High,
+            })
+            .build();
+
+        let translated = translator.translate_request(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn legacy_extra_thinking_still_works_when_canonical_absent() {
+        let transport = crate::Transport::new(crate::TransportConfig {
+            api_key: secrecy::SecretString::from("sk-ant-test"),
+            ..Default::default()
+        })
+        .unwrap();
+        let translator = AnthropicRequestTranslator::new(&transport, None);
+
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":5000}),
+        );
+
+        let req = ChatRequest::builder()
+            .model("claude-opus-4-5")
+            .messages(vec![user_msg("hi")])
+            .extra(extra)
+            .build();
+
+        let translated = translator.translate_request(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 5000);
+    }
+
+    #[test]
+    fn canonical_thinking_overrides_extra_thinking() {
+        use aigw_core::model::ThinkingRequest;
+
+        let transport = crate::Transport::new(crate::TransportConfig {
+            api_key: secrecy::SecretString::from("sk-ant-test"),
+            ..Default::default()
+        })
+        .unwrap();
+        let translator = AnthropicRequestTranslator::new(&transport, None);
+
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "thinking".into(),
+            serde_json::json!({"type":"enabled","budget_tokens":99999}),
+        );
+
+        let req = ChatRequest::builder()
+            .model("claude-opus-4-5")
+            .messages(vec![user_msg("hi")])
+            .thinking(ThinkingRequest::Budget {
+                budget_tokens: 8_000,
+            })
+            .extra(extra)
+            .build();
+
+        let translated = translator.translate_request(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+
+        assert_eq!(body["thinking"]["budget_tokens"], 8_000);
     }
 
     #[test]

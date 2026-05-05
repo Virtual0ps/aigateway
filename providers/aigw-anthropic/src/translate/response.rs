@@ -1,7 +1,11 @@
 //! Response translation: Anthropic Messages API → canonical types.
 
+use aigw_core::ForwardCompatible;
 use aigw_core::error::{ProviderError, TranslateError, map_error_status};
-use aigw_core::model::{ChatResponse, Choice, FinishReason, Message, MessageContent, Role, Usage};
+use aigw_core::model::{
+    ChatResponse, Choice, ContentPart, FinishReason, Message, MessageContent, Role, ThinkingSource,
+    TypedContentPart, Usage,
+};
 use aigw_core::translate::{ResponseTranslator, StreamParser};
 use http::{HeaderMap, StatusCode};
 
@@ -21,8 +25,17 @@ impl ResponseTranslator for AnthropicResponseTranslator {
     ) -> Result<ChatResponse, TranslateError> {
         let native: MessagesResponse = serde_json::from_slice(body)?;
 
-        // Separate text blocks and tool_use blocks.
-        let mut text_parts = Vec::new();
+        // Walk the content blocks once, splitting into:
+        // - thinking_parts: canonical Thinking / RedactedThinking content parts.
+        // - text_parts: text fragments (joined later).
+        // - tool_calls: ToolUse → canonical tool calls.
+        //
+        // If there are no thinking parts, we keep the existing
+        // `MessageContent::Text` shape for backward compatibility. With
+        // thinking parts present, the shape switches to `Parts(...)` so
+        // callers can replay thinking history on subsequent turns.
+        let mut thinking_parts: Vec<ContentPart> = Vec::new();
+        let mut text_parts: Vec<&str> = Vec::new();
         let mut tool_calls = Vec::new();
 
         for block in &native.content {
@@ -35,15 +48,49 @@ impl ResponseTranslator for AnthropicResponseTranslator {
                 }) => {
                     tool_calls.push(tools::tool_use_to_canonical(id, name, input));
                 }
-                // Thinking/RedactedThinking/Image/ToolResult/Raw: skip.
+                ContentBlock::Typed(TypedContentBlock::Thinking {
+                    thinking,
+                    signature,
+                }) => {
+                    thinking_parts.push(ForwardCompatible::Known(TypedContentPart::Thinking {
+                        thinking: thinking.clone(),
+                        signature: signature.clone(),
+                        source: Some(ThinkingSource::Anthropic),
+                        extra: Default::default(),
+                    }));
+                }
+                ContentBlock::Typed(TypedContentBlock::RedactedThinking { data }) => {
+                    thinking_parts.push(ForwardCompatible::Known(
+                        TypedContentPart::RedactedThinking {
+                            data: data.clone(),
+                            source: Some(ThinkingSource::Anthropic),
+                            extra: Default::default(),
+                        },
+                    ));
+                }
+                // Image/ToolResult/Raw: skip.
                 _ => {}
             }
         }
 
-        let content = if text_parts.is_empty() {
-            None
+        let content = if thinking_parts.is_empty() {
+            // Legacy shape: text-only message body.
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(MessageContent::Text(text_parts.join("")))
+            }
         } else {
-            Some(MessageContent::Text(text_parts.join("")))
+            // With thinking present, emit a Parts array so consumers can
+            // round-trip thinking blocks back to Anthropic on the next turn.
+            let mut parts = thinking_parts;
+            if !text_parts.is_empty() {
+                parts.push(ForwardCompatible::Known(TypedContentPart::Text {
+                    text: text_parts.join(""),
+                    extra: Default::default(),
+                }));
+            }
+            Some(MessageContent::Parts(parts))
         };
 
         let tool_calls_opt = if tool_calls.is_empty() {
@@ -245,6 +292,90 @@ mod tests {
         let usage = resp.usage.as_ref().unwrap();
         assert_eq!(usage.extra.get("cache_creation_input_tokens").unwrap(), 80);
         assert_eq!(usage.extra.get("cache_read_input_tokens").unwrap(), 20);
+    }
+
+    #[test]
+    fn translate_thinking_response_emits_parts_with_anthropic_source() {
+        let json = r#"{
+            "id": "msg_thinking",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "thinking", "thinking": "Let me reason...", "signature": "ErWj123" },
+                { "type": "text", "text": "The answer is 42." }
+            ],
+            "model": "claude-opus-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 30, "output_tokens": 20 }
+        }"#;
+
+        let translator = AnthropicResponseTranslator;
+        let resp = translator
+            .translate_response(StatusCode::OK, json.as_bytes())
+            .unwrap();
+
+        let choice = &resp.choices[0];
+        let parts = match choice.message.content.as_ref().unwrap() {
+            MessageContent::Parts(p) => p,
+            other => panic!("expected Parts (thinking present), got {other:?}"),
+        };
+        assert_eq!(parts.len(), 2);
+
+        match &parts[0] {
+            ContentPart::Known(TypedContentPart::Thinking {
+                thinking,
+                signature,
+                source,
+                ..
+            }) => {
+                assert_eq!(thinking, "Let me reason...");
+                assert_eq!(signature, "ErWj123");
+                assert_eq!(*source, Some(ThinkingSource::Anthropic));
+            }
+            other => panic!("expected Thinking, got {other:?}"),
+        }
+
+        match &parts[1] {
+            ContentPart::Known(TypedContentPart::Text { text, .. }) => {
+                assert_eq!(text, "The answer is 42.");
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_redacted_thinking_response() {
+        let json = r#"{
+            "id": "msg_red",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                { "type": "redacted_thinking", "data": "blob" },
+                { "type": "text", "text": "ok" }
+            ],
+            "model": "claude-opus-4-6",
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }"#;
+
+        let translator = AnthropicResponseTranslator;
+        let resp = translator
+            .translate_response(StatusCode::OK, json.as_bytes())
+            .unwrap();
+
+        let parts = match resp.choices[0].message.content.as_ref().unwrap() {
+            MessageContent::Parts(p) => p,
+            other => panic!("expected Parts, got {other:?}"),
+        };
+
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Known(TypedContentPart::RedactedThinking {
+                data, source: Some(ThinkingSource::Anthropic), ..
+            }) if data == "blob"
+        ));
     }
 
     #[test]
