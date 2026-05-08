@@ -18,11 +18,16 @@
 //! [`GenerateContentResponse`]: crate::types::GenerateContentResponse
 //! [`ThinkingSource::Gemini`]: aigw_core::model::ThinkingSource::Gemini
 
+pub mod native_bridge;
 pub mod request;
 pub mod response;
 pub mod stream;
 pub mod thinking;
 
+pub use native_bridge::{
+    SseContext as NativeSseContext, chat_response_to_gemini, gemini_request_to_canonical,
+    stream_event_to_gemini_sse,
+};
 pub use request::{
     GeminiRequestTranslator, build_generate_content_request,
     build_generate_content_request_with_projector,
