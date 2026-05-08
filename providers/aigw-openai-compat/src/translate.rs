@@ -144,6 +144,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
             extra: Default::default(),
         }
     }
@@ -181,6 +182,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
             extra: Default::default(),
         }
     }

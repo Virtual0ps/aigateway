@@ -29,8 +29,13 @@
 pub mod client;
 pub mod error;
 pub mod streaming;
+pub mod translate;
 pub mod types;
 
 pub use client::{Client, ClientConfig};
 pub use error::Error;
+pub use translate::{
+    GeminiRequestTranslator, GeminiResponseTranslator, GeminiStreamParser, GeminiThinkingProjector,
+    GeminiThinkingTarget,
+};
 pub use types::*;

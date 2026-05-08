@@ -56,10 +56,12 @@ dependencies = [
 name = "aigw-gemini"
 version = "0.4.0"
 dependencies = [
+ "aigw-core",
  "bon",
  "bytes",
  "eventsource-stream",
  "futures",
+ "http",
  "reqwest",
  "secrecy",
  "serde",
