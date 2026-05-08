@@ -99,6 +99,14 @@ pub struct TextBlock {
 pub struct CacheControl {
     /// Cache type — currently only `"ephemeral"`.
     pub r#type: String,
+    /// Optional TTL in seconds. Defaults server-side to 5 minutes (300s).
+    /// Longer TTLs (e.g. 3600s = 1h) are available under the
+    /// `prompt-caching-scope-2026-01-05` beta. The Anthropic API requires
+    /// that any block with a longer TTL appear *before* any short-TTL
+    /// block in evaluation order (tools → system → messages); see
+    /// [`crate::translate::cache_control::normalize_ttl_ordering`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u64>,
 }
 
 /// Request metadata.
@@ -269,6 +277,10 @@ pub struct Tool {
     pub description: Option<String>,
     /// JSON Schema for the tool's input parameters.
     pub input_schema: serde_json::Value,
+    /// Optional cache control for prompt caching. Setting this on the last
+    /// tool produces a cache breakpoint covering all preceding tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Tool selection strategy.

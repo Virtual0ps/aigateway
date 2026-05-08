@@ -19,6 +19,10 @@ use crate::types::{
     MessagesRequest, Metadata, Role as AnthropicRole, SystemPrompt, TypedContentBlock,
 };
 
+use super::cache_control::{
+    CacheControlStrategy, DefaultCacheControlStrategy, enforce_breakpoint_cap,
+    normalize_ttl_ordering,
+};
 use super::thinking::{AnthropicThinkingProjector, AnthropicThinkingTarget};
 use super::tools;
 
@@ -30,6 +34,7 @@ pub struct AnthropicRequestTranslator {
     url: String,
     default_max_tokens: u64,
     thinking: Box<dyn ThinkingProjector<AnthropicThinkingTarget>>,
+    cache_control: Box<dyn CacheControlStrategy>,
 }
 
 impl AnthropicRequestTranslator {
@@ -39,6 +44,7 @@ impl AnthropicRequestTranslator {
             url: transport.url("/v1/messages"),
             default_max_tokens: default_max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
             thinking: Box::new(AnthropicThinkingProjector::default()),
+            cache_control: Box::new(DefaultCacheControlStrategy::default()),
         }
     }
 
@@ -52,6 +58,19 @@ impl AnthropicRequestTranslator {
         projector: Box<dyn ThinkingProjector<AnthropicThinkingTarget>>,
     ) -> Self {
         self.thinking = projector;
+        self
+    }
+
+    /// Replace the cache-control strategy. Use a different positioning
+    /// policy or [`super::cache_control::NoCacheControlStrategy`] to
+    /// disable automatic injection while still keeping the always-on
+    /// 4-breakpoint cap and TTL ordering enforcement.
+    #[must_use]
+    pub fn with_cache_control_strategy(
+        mut self,
+        strategy: Box<dyn CacheControlStrategy>,
+    ) -> Self {
+        self.cache_control = strategy;
         self
     }
 }
@@ -104,7 +123,7 @@ impl RequestTranslator for AnthropicRequestTranslator {
             extra.remove("output_config");
         }
 
-        let native = MessagesRequest::builder()
+        let mut native = MessagesRequest::builder()
             .model(&req.model)
             .messages(messages)
             .max_tokens(target.max_tokens)
@@ -121,6 +140,12 @@ impl RequestTranslator for AnthropicRequestTranslator {
             .maybe_thinking(target.thinking)
             .extra(extra)
             .build();
+
+        // Cache-control pipeline: configurable strategy first, then the
+        // always-on Anthropic API correctness rules.
+        self.cache_control.apply(&mut native);
+        enforce_breakpoint_cap(&mut native);
+        normalize_ttl_ordering(&mut native);
 
         let body = serde_json::to_vec(&native)?;
 
@@ -809,6 +834,72 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
 
         assert_eq!(body["thinking"]["budget_tokens"], 8_000);
+    }
+
+    #[test]
+    fn translate_injects_cache_control_on_default() {
+        let transport = crate::Transport::new(crate::TransportConfig {
+            api_key: secrecy::SecretString::from("sk-ant-test"),
+            ..Default::default()
+        })
+        .unwrap();
+        let translator = AnthropicRequestTranslator::new(&transport, None);
+
+        let req = ChatRequest::builder()
+            .model("claude-opus-4-5")
+            .messages(vec![
+                user_msg("first"),
+                Message {
+                    role: Role::Assistant,
+                    content: Some(MessageContent::Text("ok".into())),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
+                    extra: Default::default(),
+                },
+                user_msg("second"),
+            ])
+            .build();
+
+        let translated = translator.translate_request(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+        // First user message (= second-to-last user) should have the
+        // breakpoint injected on its first content block.
+        let cc = &body["messages"][0]["content"][0]["cache_control"];
+        assert_eq!(cc["type"], "ephemeral");
+    }
+
+    #[test]
+    fn translate_with_no_cache_control_strategy() {
+        use super::super::cache_control::NoCacheControlStrategy;
+        let transport = crate::Transport::new(crate::TransportConfig {
+            api_key: secrecy::SecretString::from("sk-ant-test"),
+            ..Default::default()
+        })
+        .unwrap();
+        let translator = AnthropicRequestTranslator::new(&transport, None)
+            .with_cache_control_strategy(Box::new(NoCacheControlStrategy));
+
+        let req = ChatRequest::builder()
+            .model("claude-opus-4-5")
+            .messages(vec![user_msg("first"), user_msg("second")])
+            .build();
+
+        let translated = translator.translate_request(&req).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&translated.body).unwrap();
+        // Strategy disabled → no breakpoints injected.
+        // (Messages may still serialize as plain strings.)
+        let messages = body["messages"].as_array().unwrap();
+        for msg in messages {
+            // String content has no cache_control hook to begin with.
+            // If it's been promoted to an array, none of the blocks should
+            // carry a cache_control field.
+            if let Some(content) = msg["content"].as_array() {
+                for block in content {
+                    assert!(block.get("cache_control").is_none());
+                }
+            }
+        }
     }
 
     #[test]

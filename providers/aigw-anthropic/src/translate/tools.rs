@@ -27,6 +27,7 @@ pub fn translate_tools(tools: &[CanonicalTool]) -> Vec<AnthropicTool> {
                 .parameters
                 .clone()
                 .unwrap_or(serde_json::json!({"type": "object"})),
+            cache_control: None,
         })
         .collect()
 }

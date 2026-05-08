@@ -7,12 +7,17 @@
 //! - Tool results are restructured into user messages with content blocks
 //! - Streaming events use a different granularity (block-level vs choice-level)
 
+pub mod cache_control;
 pub mod request;
 pub mod response;
 pub mod stream;
 pub mod thinking;
 pub mod tools;
 
+pub use cache_control::{
+    CacheControlStrategy, DefaultCacheControlStrategy, MAX_CACHE_BREAKPOINTS,
+    NoCacheControlStrategy, ephemeral_marker, ephemeral_marker_with_ttl,
+};
 pub use request::AnthropicRequestTranslator;
 pub use response::AnthropicResponseTranslator;
 pub use stream::AnthropicStreamParser;
