@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 ///     })
 ///     .build();
 /// ```
-#[derive(Debug, Clone, Builder, Serialize)]
+#[derive(Debug, Clone, Builder, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[builder(on(String, into))]
 pub struct GenerateContentRequest {
