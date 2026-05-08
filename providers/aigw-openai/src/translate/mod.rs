@@ -15,14 +15,16 @@ mod response;
 mod responses_request;
 mod responses_response;
 pub(crate) mod responses_stream;
+mod responses_thinking;
 mod stream;
 
 pub use request::OpenAIRequestTranslator;
 pub use response::OpenAIResponseTranslator;
 pub use responses_request::{
     ResponsesRequestConfig, ResponsesRequestTranslator, SystemHandling,
-    build_responses_create_request,
+    build_responses_create_request, build_responses_create_request_with_projector,
 };
 pub use responses_response::ResponsesResponseTranslator;
 pub use responses_stream::ResponsesStreamParser;
+pub use responses_thinking::{OpenAIResponsesThinkingProjector, ResponsesThinkingTarget};
 pub use stream::OpenAIStreamParser;

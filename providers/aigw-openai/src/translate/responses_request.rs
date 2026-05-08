@@ -14,11 +14,12 @@ use aigw_core::error::TranslateError;
 use aigw_core::model::{
     ChatRequest, MessageContent, ResponseFormat, Role, Tool, ToolCall, ToolChoice,
 };
-use aigw_core::translate::{RequestTranslator, TranslatedRequest};
+use aigw_core::translate::{RequestTranslator, ThinkingProjector, TranslatedRequest};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use serde_json::{Value, json};
 
+use super::responses_thinking::{OpenAIResponsesThinkingProjector, ResponsesThinkingTarget};
 use crate::transport::OpenAITransport;
 use crate::wire_types::{
     ResponseCreateRequest, ResponseInput, ResponseTextConfig, ResponseTool, ResponseToolChoice,
@@ -178,6 +179,7 @@ impl ResponsesRequestConfig {
 pub struct ResponsesRequestTranslator {
     transport: OpenAITransport,
     config: ResponsesRequestConfig,
+    thinking: Box<dyn ThinkingProjector<ResponsesThinkingTarget>>,
 }
 
 impl ResponsesRequestTranslator {
@@ -185,6 +187,7 @@ impl ResponsesRequestTranslator {
         Self {
             transport,
             config: ResponsesRequestConfig::default(),
+            thinking: Box::new(OpenAIResponsesThinkingProjector::default()),
         }
     }
 
@@ -192,11 +195,23 @@ impl ResponsesRequestTranslator {
         self.config = config;
         self
     }
+
+    /// Replace the thinking projector. Use for custom budget→effort
+    /// thresholds or any other [`ThinkingProjector<ResponsesThinkingTarget>`]
+    /// implementation.
+    #[must_use]
+    pub fn with_thinking_projector(
+        mut self,
+        projector: Box<dyn ThinkingProjector<ResponsesThinkingTarget>>,
+    ) -> Self {
+        self.thinking = projector;
+        self
+    }
 }
 
 impl RequestTranslator for ResponsesRequestTranslator {
     fn translate_request(&self, req: &ChatRequest) -> Result<TranslatedRequest, TranslateError> {
-        let responses_req = chat_request_to_responses(req, &self.config)?;
+        let responses_req = chat_request_to_responses(req, &self.config, self.thinking.as_ref())?;
         let body = serde_json::to_vec(&responses_req)?;
         let transport_req = self
             .transport
@@ -215,7 +230,8 @@ impl RequestTranslator for ResponsesRequestTranslator {
         &self,
         req: &ChatRequest,
     ) -> Result<TranslatedRequest, TranslateError> {
-        let mut responses_req = chat_request_to_responses(req, &self.config)?;
+        let mut responses_req =
+            chat_request_to_responses(req, &self.config, self.thinking.as_ref())?;
         responses_req.stream = Some(true);
 
         let body = serde_json::to_vec(&responses_req)?;
@@ -244,6 +260,10 @@ impl RequestTranslator for ResponsesRequestTranslator {
 /// `TranslatedRequest` with URL/headers included, use
 /// [`ResponsesRequestTranslator`].
 ///
+/// Uses the default [`OpenAIResponsesThinkingProjector`] for canonical
+/// thinking handling. Pass a custom projector via
+/// [`build_responses_create_request_with_projector`] if needed.
+///
 /// # Errors
 ///
 /// Returns [`TranslateError`] if any field in `req` fails to translate (for
@@ -252,13 +272,29 @@ pub fn build_responses_create_request(
     req: &ChatRequest,
     config: &ResponsesRequestConfig,
 ) -> Result<ResponseCreateRequest, TranslateError> {
-    chat_request_to_responses(req, config)
+    let projector = OpenAIResponsesThinkingProjector::default();
+    chat_request_to_responses(req, config, &projector)
+}
+
+/// Like [`build_responses_create_request`] but with a caller-provided
+/// thinking projector.
+///
+/// # Errors
+///
+/// Returns [`TranslateError`] if any field in `req` fails to translate.
+pub fn build_responses_create_request_with_projector(
+    req: &ChatRequest,
+    config: &ResponsesRequestConfig,
+    projector: &dyn ThinkingProjector<ResponsesThinkingTarget>,
+) -> Result<ResponseCreateRequest, TranslateError> {
+    chat_request_to_responses(req, config, projector)
 }
 
 /// Core conversion: `ChatRequest` → `ResponseCreateRequest`.
 fn chat_request_to_responses(
     req: &ChatRequest,
     config: &ResponsesRequestConfig,
+    thinking: &dyn ThinkingProjector<ResponsesThinkingTarget>,
 ) -> Result<ResponseCreateRequest, TranslateError> {
     let mut instructions_parts: Vec<String> = Vec::new();
     let mut input_items: Vec<Value> = Vec::new();
@@ -374,7 +410,7 @@ fn chat_request_to_responses(
         .and_then(Value::as_bool)
         .or(config.default_store);
 
-    let reasoning = build_reasoning(req, config);
+    let reasoning = build_reasoning(req, config, thinking);
 
     let include = req
         .extra
@@ -445,36 +481,60 @@ fn chat_request_to_responses(
     })
 }
 
-/// Build the `reasoning` object from `ChatRequest.extra` fields and config defaults.
+/// Build the `reasoning` object.
 ///
-/// Priority:
-/// 1. `extra.reasoning` object (Responses API native form)
-/// 2. `extra.reasoning_effort` string (Chat Completions shorthand) → `reasoning.effort`
-/// 3. `config.default_reasoning_effort` → `reasoning.effort`
-/// 4. `config.default_reasoning_summary` → `reasoning.summary`
-fn build_reasoning(req: &ChatRequest, config: &ResponsesRequestConfig) -> Option<Value> {
-    let mut obj = serde_json::Map::new();
-
-    // Base from extra.reasoning (nested form).
-    if let Some(Value::Object(base)) = req.extra.get("reasoning") {
-        for (k, v) in base {
-            obj.insert(k.clone(), v.clone());
+/// Priority (highest → lowest):
+/// 1. Canonical `req.thinking` (via [`ThinkingProjector`]). If the projector
+///    sets `disable=true` (canonical `Disabled`), the entire `reasoning`
+///    field is omitted from the wire body.
+/// 2. `extra.reasoning` object (Responses API native form). Fills any
+///    fields not already set by canonical.
+/// 3. `extra.reasoning_effort` string (Chat Completions shorthand) →
+///    `reasoning.effort`. Filled only if effort is still unset.
+/// 4. `config.default_reasoning_effort` → `reasoning.effort`.
+/// 5. `config.default_reasoning_summary` → `reasoning.summary`.
+fn build_reasoning(
+    req: &ChatRequest,
+    config: &ResponsesRequestConfig,
+    thinking: &dyn ThinkingProjector<ResponsesThinkingTarget>,
+) -> Option<Value> {
+    // 1. Canonical via projector.
+    let mut canon = ResponsesThinkingTarget::default();
+    if req.thinking.is_some() {
+        thinking.apply(&req.model, req.thinking.as_ref(), &mut canon);
+        if canon.disable {
+            // Disabled: drop reasoning entirely. Even config defaults are
+            // suppressed — the user explicitly turned thinking off.
+            return None;
         }
     }
 
-    // Override effort from reasoning_effort shorthand if not already set.
+    let mut obj = serde_json::Map::new();
+    if let Some(effort) = canon.effort {
+        obj.insert("effort".into(), Value::String(effort));
+    }
+
+    // 2. extra.reasoning object — fill any fields canonical didn't set.
+    if let Some(Value::Object(base)) = req.extra.get("reasoning") {
+        for (k, v) in base {
+            obj.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+
+    // 3. extra.reasoning_effort shorthand → effort.
     if !obj.contains_key("effort")
         && let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str)
     {
         obj.insert("effort".into(), Value::String(effort.to_owned()));
     }
 
-    // Apply config defaults if nothing was provided.
+    // 4. Config default for effort.
     if !obj.contains_key("effort")
         && let Some(default) = &config.default_reasoning_effort
     {
         obj.insert("effort".into(), Value::String(default.clone()));
     }
+    // 5. Config default for summary.
     if !obj.contains_key("summary")
         && let Some(default) = &config.default_reasoning_summary
     {
@@ -732,7 +792,24 @@ mod tests {
         ToolCall, ToolChoice, ToolChoiceMode,
     };
 
-    use super::{ResponsesRequestConfig, SystemHandling, chat_request_to_responses};
+    use aigw_core::error::TranslateError;
+
+    use super::{
+        OpenAIResponsesThinkingProjector, ResponsesRequestConfig, SystemHandling,
+        chat_request_to_responses as inner,
+    };
+    use crate::wire_types::ResponseCreateRequest;
+
+    /// Test shim: forwards to the real `chat_request_to_responses` with the
+    /// default thinking projector. Keeps existing call shape (2 args + unwrap)
+    /// across the test suite.
+    fn chat_request_to_responses(
+        req: &ChatRequest,
+        config: &ResponsesRequestConfig,
+    ) -> Result<ResponseCreateRequest, TranslateError> {
+        let projector = OpenAIResponsesThinkingProjector::default();
+        inner(req, config, &projector)
+    }
 
     fn default_config() -> ResponsesRequestConfig {
         ResponsesRequestConfig::default()
@@ -776,6 +853,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
             extra: Default::default(),
         }
     }
@@ -1031,6 +1109,89 @@ mod tests {
         let reasoning = resp.reasoning.unwrap();
         assert_eq!(reasoning["effort"], "medium");
         assert_eq!(reasoning["summary"], "auto");
+    }
+
+    #[test]
+    fn canonical_thinking_level_sets_effort() {
+        use aigw_core::model::{ThinkingLevel, ThinkingRequest};
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Level {
+            level: ThinkingLevel::High,
+        });
+        let resp = chat_request_to_responses(&req, &default_config()).unwrap();
+        assert_eq!(resp.reasoning.unwrap()["effort"], "high");
+    }
+
+    #[test]
+    fn canonical_thinking_overrides_extra_reasoning_effort() {
+        use aigw_core::model::{ThinkingLevel, ThinkingRequest};
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Level {
+            level: ThinkingLevel::Low,
+        });
+        req.extra.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String("high".into()),
+        );
+        let resp = chat_request_to_responses(&req, &default_config()).unwrap();
+        // Canonical wins.
+        assert_eq!(resp.reasoning.unwrap()["effort"], "low");
+    }
+
+    #[test]
+    fn canonical_thinking_overrides_config_default() {
+        use aigw_core::model::{ThinkingLevel, ThinkingRequest};
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Level {
+            level: ThinkingLevel::Low,
+        });
+        // Codex config defaults effort to "medium" — canonical must win.
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        let reasoning = resp.reasoning.unwrap();
+        assert_eq!(reasoning["effort"], "low");
+        assert_eq!(reasoning["summary"], "auto"); // summary still from config default
+    }
+
+    #[test]
+    fn canonical_disabled_omits_reasoning_field() {
+        use aigw_core::model::ThinkingRequest;
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Disabled);
+        // Codex config has reasoning defaults — Disabled must suppress them.
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        assert!(
+            resp.reasoning.is_none(),
+            "Disabled must drop reasoning entirely"
+        );
+    }
+
+    #[test]
+    fn canonical_thinking_merges_summary_from_extra() {
+        use aigw_core::model::{ThinkingLevel, ThinkingRequest};
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Level {
+            level: ThinkingLevel::High,
+        });
+        // User sets summary in extra.reasoning — canonical effort wins,
+        // summary still merges through.
+        req.extra.insert(
+            "reasoning".into(),
+            serde_json::json!({"summary":"detailed"}),
+        );
+        let resp = chat_request_to_responses(&req, &default_config()).unwrap();
+        let reasoning = resp.reasoning.unwrap();
+        assert_eq!(reasoning["effort"], "high");
+        assert_eq!(reasoning["summary"], "detailed");
+    }
+
+    #[test]
+    fn canonical_auto_falls_through_to_extra_or_default() {
+        use aigw_core::model::ThinkingRequest;
+        let mut req = minimal_request();
+        req.thinking = Some(ThinkingRequest::Auto);
+        // Auto leaves canonical effort unset → fall through to codex default.
+        let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
+        assert_eq!(resp.reasoning.unwrap()["effort"], "medium");
     }
 
     #[test]

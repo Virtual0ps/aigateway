@@ -118,6 +118,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
             extra: Default::default(),
         };
 
@@ -156,6 +157,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -191,6 +193,7 @@ mod tests {
             n: None,
             seed: None,
             user: None,
+            thinking: None,
             extra: Default::default(),
         };
 

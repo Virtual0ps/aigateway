@@ -6,18 +6,27 @@
 //! and reasoning blocks (encrypted_content / reasoning_signature).
 
 use aigw_core::error::TranslateError;
-use aigw_core::model::{FinishReason, StreamEvent, Usage};
+use aigw_core::model::{FinishReason, StreamEvent, ThinkingSource, Usage};
 use aigw_core::translate::StreamParser;
+
+/// State for a currently-open reasoning output item.
+#[derive(Debug, Clone)]
+struct OpenReasoning {
+    /// Canonical reasoning index (separate counter from `tool_call_index`).
+    canonical_index: u32,
+    /// Buffered `encrypted_content` from the `output_item.added` event.
+    /// Emitted as `ReasoningEnd { signature }` when the block closes.
+    signature: String,
+}
 
 /// Parses OpenAI Responses API SSE events into canonical streaming events.
 pub struct ResponsesStreamParser {
     meta_emitted: bool,
     tool_call_index: u32,
-    /// Buffered `encrypted_content` from a reasoning `output_item.added` event.
-    /// Emitted as `ReasoningSignature` when the reasoning block finalizes.
-    thinking_signature: Option<String>,
-    /// True while a reasoning output item is open (between added and done).
-    thinking_block_open: bool,
+    /// Counter for canonical `ReasoningStart`/`ReasoningEnd` indices.
+    reasoning_index: u32,
+    /// Currently-open reasoning block, if any.
+    open_reasoning: Option<OpenReasoning>,
 }
 
 impl Default for ResponsesStreamParser {
@@ -31,17 +40,19 @@ impl ResponsesStreamParser {
         Self {
             meta_emitted: false,
             tool_call_index: 0,
-            thinking_signature: None,
-            thinking_block_open: false,
+            reasoning_index: 0,
+            open_reasoning: None,
         }
     }
 
-    /// Flush a pending reasoning signature, returning an event if one was buffered.
-    fn flush_signature(&mut self) -> Option<StreamEvent> {
-        self.thinking_block_open = false;
-        self.thinking_signature
+    /// Close any open reasoning block, returning a `ReasoningEnd` event.
+    fn close_reasoning(&mut self) -> Option<StreamEvent> {
+        self.open_reasoning
             .take()
-            .map(StreamEvent::ReasoningSignature)
+            .map(|r| StreamEvent::ReasoningEnd {
+                index: r.canonical_index,
+                signature: r.signature,
+            })
     }
 }
 
@@ -85,17 +96,27 @@ impl StreamParser for ResponsesStreamParser {
             "response.output_item.added"
                 if ev.pointer("/item/type").and_then(|v| v.as_str()) == Some("reasoning") =>
             {
-                self.thinking_block_open = true;
-                self.thinking_signature = ev
+                let signature = ev
                     .pointer("/item/encrypted_content")
                     .and_then(|v| v.as_str())
-                    .map(String::from);
+                    .map(String::from)
+                    .unwrap_or_default();
+                let index = self.reasoning_index;
+                self.reasoning_index += 1;
+                self.open_reasoning = Some(OpenReasoning {
+                    canonical_index: index,
+                    signature,
+                });
+                events.push(StreamEvent::ReasoningStart {
+                    index,
+                    source: Some(ThinkingSource::OpenaiResponses),
+                });
             }
 
             "response.output_item.done"
                 if ev.pointer("/item/type").and_then(|v| v.as_str()) == Some("reasoning") =>
             {
-                if let Some(ev) = self.flush_signature() {
+                if let Some(ev) = self.close_reasoning() {
                     events.push(ev);
                 }
             }
@@ -125,9 +146,9 @@ impl StreamParser for ResponsesStreamParser {
             "response.output_item.added"
                 if ev.pointer("/item/type").and_then(|v| v.as_str()) == Some("function_call") =>
             {
-                // Flush pending reasoning signature before tool calls start.
-                if let Some(sig) = self.flush_signature() {
-                    events.push(sig);
+                // Close any still-open reasoning block before tool calls start.
+                if let Some(end) = self.close_reasoning() {
+                    events.push(end);
                 }
 
                 let id = ev
@@ -257,7 +278,9 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_signature_emitted_on_block_done() {
+    fn reasoning_block_emits_start_and_end() {
+        use aigw_core::model::ThinkingSource;
+
         let mut p = parser();
 
         let added = r#"{
@@ -265,25 +288,36 @@ mod tests {
             "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "sig_abc123" }
         }"#;
         let events = p.parse_event("", added).unwrap();
-        assert!(events.is_empty(), "added should buffer, not emit");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ReasoningStart { index: 0, source: Some(ThinkingSource::OpenaiResponses) }
+        ));
 
         let done = r#"{
             "type": "response.output_item.done",
             "item": { "type": "reasoning", "id": "rs_1" }
         }"#;
         let events = p.parse_event("", done).unwrap();
-        assert!(matches!(&events[0], StreamEvent::ReasoningSignature(s) if s == "sig_abc123"));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ReasoningEnd { index: 0, signature } if signature == "sig_abc123"
+        ));
     }
 
     #[test]
-    fn reasoning_signature_flushed_before_tool_call() {
+    fn reasoning_end_emitted_before_tool_call() {
         let mut p = parser();
 
         let added = r#"{
             "type": "response.output_item.added",
             "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "sig_xyz" }
         }"#;
-        p.parse_event("", added).unwrap();
+        let events = p.parse_event("", added).unwrap();
+        // ReasoningStart was emitted on `added`.
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], StreamEvent::ReasoningStart { .. }));
 
         // Tool call starts before reasoning block is explicitly "done".
         let tc = r#"{
@@ -292,9 +326,59 @@ mod tests {
         }"#;
         let events = p.parse_event("", tc).unwrap();
         assert_eq!(events.len(), 2);
-        assert!(matches!(&events[0], StreamEvent::ReasoningSignature(s) if s == "sig_xyz"));
+        assert!(matches!(
+            &events[0],
+            StreamEvent::ReasoningEnd { index: 0, signature } if signature == "sig_xyz"
+        ));
         assert!(matches!(
             &events[1],
+            StreamEvent::ToolCallStart { index: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn reasoning_index_separate_from_tool_call_index() {
+        // Two reasoning blocks → indices 0, 1; tool call still starts at 0.
+        let mut p = parser();
+        let r1 = r#"{
+            "type":"response.output_item.added",
+            "item":{"type":"reasoning","encrypted_content":"s1"}
+        }"#;
+        let e = p.parse_event("", r1).unwrap();
+        assert!(matches!(
+            e[0],
+            StreamEvent::ReasoningStart { index: 0, .. }
+        ));
+        let d1 = r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#;
+        let e = p.parse_event("", d1).unwrap();
+        assert!(matches!(
+            e[0],
+            StreamEvent::ReasoningEnd { index: 0, .. }
+        ));
+
+        let r2 = r#"{
+            "type":"response.output_item.added",
+            "item":{"type":"reasoning","encrypted_content":"s2"}
+        }"#;
+        let e = p.parse_event("", r2).unwrap();
+        assert!(matches!(
+            e[0],
+            StreamEvent::ReasoningStart { index: 1, .. }
+        ));
+        let d2 = r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#;
+        let e = p.parse_event("", d2).unwrap();
+        assert!(matches!(
+            e[0],
+            StreamEvent::ReasoningEnd { index: 1, .. }
+        ));
+
+        let tc = r#"{
+            "type":"response.output_item.added",
+            "item":{"type":"function_call","call_id":"c1","name":"f"}
+        }"#;
+        let e = p.parse_event("", tc).unwrap();
+        assert!(matches!(
+            e[0],
             StreamEvent::ToolCallStart { index: 0, .. }
         ));
     }
