@@ -23,7 +23,10 @@ pub mod response;
 pub mod stream;
 pub mod thinking;
 
-pub use request::GeminiRequestTranslator;
+pub use request::{
+    GeminiRequestTranslator, build_generate_content_request,
+    build_generate_content_request_with_projector,
+};
 pub use response::GeminiResponseTranslator;
 pub use stream::GeminiStreamParser;
 pub use thinking::{GeminiThinkingProjector, GeminiThinkingTarget};

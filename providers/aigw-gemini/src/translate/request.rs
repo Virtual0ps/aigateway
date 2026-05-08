@@ -138,6 +138,44 @@ impl RequestTranslator for GeminiRequestTranslator {
     }
 }
 
+// ─── Public body builder ───────────────────────────────────────────────────
+
+/// Build a [`GenerateContentRequest`] from a canonical [`ChatRequest`]
+/// without constructing a [`GeminiRequestTranslator`].
+///
+/// Use this when you only need the translated body (for example, as a
+/// downstream gateway that wraps the Gemini request in a custom envelope
+/// — Antigravity's `/v1internal:generateContent` is one such case). For
+/// the full [`TranslatedRequest`] with URL/headers included, use
+/// [`GeminiRequestTranslator`].
+///
+/// Defaults to [`GeminiThinkingProjector::default`] for canonical
+/// thinking handling. Pass a custom projector via
+/// [`build_generate_content_request_with_projector`] if needed.
+///
+/// # Errors
+///
+/// Returns [`TranslateError`] if any field in `req` fails to translate.
+pub fn build_generate_content_request(
+    req: &ChatRequest,
+) -> Result<GenerateContentRequest, TranslateError> {
+    let projector = GeminiThinkingProjector::default();
+    build_body(req, &projector)
+}
+
+/// Like [`build_generate_content_request`] but with a caller-provided
+/// thinking projector.
+///
+/// # Errors
+///
+/// Returns [`TranslateError`] if any field in `req` fails to translate.
+pub fn build_generate_content_request_with_projector(
+    req: &ChatRequest,
+    projector: &dyn ThinkingProjector<GeminiThinkingTarget>,
+) -> Result<GenerateContentRequest, TranslateError> {
+    build_body(req, projector)
+}
+
 // ─── Body builder ───────────────────────────────────────────────────────────
 
 fn build_body(
