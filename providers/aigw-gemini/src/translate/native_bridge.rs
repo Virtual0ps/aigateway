@@ -28,20 +28,24 @@
 //! [`GeminiRequestTranslator`]: super::request::GeminiRequestTranslator
 //! [`GeminiResponseTranslator`]: super::response::GeminiResponseTranslator
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use aigw_core::ForwardCompatible;
 use aigw_core::error::TranslateError;
 use aigw_core::model::{
     ChatRequest, ChatResponse, ContentPart, FinishReason as CanonicalFinishReason, FunctionCall,
-    Message, MessageContent, Role, StreamEvent, ThinkingSource, Tool as CanonicalTool, ToolCall,
-    ToolChoice, ToolChoiceMode, TypedContentPart, Usage,
+    ImageUrl, JsonSchema, Message, MessageContent, NamedToolChoice, NamedToolChoiceFunction,
+    ResponseFormat, Role, StreamEvent, ThinkingLevel as CanonicalThinkingLevel, ThinkingRequest,
+    ThinkingSource, Tool as CanonicalTool, ToolCall, ToolChoice, ToolChoiceMode, TypedContentPart,
+    Usage,
 };
 use serde_json::{Value, json};
 
 use crate::types::{
     Candidate, Content, FinishReason as NativeFinishReason, FunctionCall as NativeFunctionCall,
-    FunctionResponse, GenerateContentRequest, GenerateContentResponse, Part, Role as NativeRole,
+    FunctionCallingConfig, FunctionCallingMode, FunctionResponse, GenerateContentRequest,
+    GenerateContentResponse, GenerationConfig, Part, Role as NativeRole,
+    ThinkingConfig as NativeThinkingConfig, ThinkingLevel as NativeThinkingLevel, ToolConfig,
     UsageMetadata,
 };
 
@@ -62,7 +66,10 @@ use crate::types::{
 pub fn gemini_request_to_canonical(
     req: GenerateContentRequest,
 ) -> Result<ChatRequest, TranslateError> {
+    reject_unsupported_native_request_features(&req)?;
+
     let mut messages: Vec<Message> = Vec::new();
+    let mut pending_tool_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
 
     // System instruction → role: System message at the front.
     if let Some(sys) = req.system_instruction {
@@ -94,12 +101,16 @@ pub fn gemini_request_to_canonical(
                 // tool-role message so the canonical contract holds.
                 for p in parts {
                     if let Some(fr) = p.function_response {
-                        messages.push(message_from_function_response(fr));
+                        messages.push(message_from_function_response(
+                            fr,
+                            &mut pending_tool_call_ids,
+                        ));
                     }
                 }
             }
             Role::Assistant => {
                 let (content_field, tool_calls) = split_assistant_parts(parts);
+                remember_pending_tool_calls(&tool_calls, &mut pending_tool_call_ids);
                 messages.push(Message {
                     role: Role::Assistant,
                     content: content_field,
@@ -115,7 +126,10 @@ pub fn gemini_request_to_canonical(
             _ => {
                 let (tool_results, user_parts) = partition_function_responses(parts);
                 for fr in tool_results {
-                    messages.push(message_from_function_response(fr));
+                    messages.push(message_from_function_response(
+                        fr,
+                        &mut pending_tool_call_ids,
+                    ));
                 }
                 if !user_parts.is_empty() {
                     let content_field = user_parts_to_content(user_parts);
@@ -132,17 +146,24 @@ pub fn gemini_request_to_canonical(
         }
     }
 
+    let tool_config = req.tool_config;
+    let allowed_function_names = constrained_allowed_function_names(tool_config.as_ref());
+
     // Tools.
     let tools: Option<Vec<CanonicalTool>> = req.tools.map(|gemini_tools| {
         gemini_tools
             .into_iter()
             .flat_map(|t| t.function_declarations.unwrap_or_default())
+            .filter(|d| match allowed_function_names {
+                Some(allowed) => allowed.iter().any(|name| name == &d.name),
+                None => true,
+            })
             .map(|d| CanonicalTool {
                 kind: "function".to_owned(),
                 function: aigw_core::model::FunctionDefinition {
                     name: d.name,
                     description: d.description,
-                    parameters: d.parameters,
+                    parameters: d.parameters.as_ref().map(schema_types_to_canonical),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -152,23 +173,25 @@ pub fn gemini_request_to_canonical(
     });
 
     // Tool choice.
-    let tool_choice = req.tool_config.and_then(|tc| {
-        tc.function_calling_config.map(|fcc| {
-            use crate::types::FunctionCallingMode;
-            match fcc.mode {
-                Some(FunctionCallingMode::Auto) => ToolChoice::Mode(ToolChoiceMode::Auto),
-                Some(FunctionCallingMode::None) => ToolChoice::Mode(ToolChoiceMode::None),
-                Some(FunctionCallingMode::Any) => ToolChoice::Mode(ToolChoiceMode::Required),
-                _ => ToolChoice::Mode(ToolChoiceMode::Auto),
-            }
-        })
+    let tool_choice = tool_config.and_then(|tc| {
+        tc.function_calling_config
+            .map(native_tool_choice_to_canonical)
     });
 
     // Generation config.
-    let (temperature, top_p, max_tokens, stop, seed, frequency_penalty, presence_penalty) = req
-        .generation_config
-        .as_ref()
-        .map_or((None, None, None, None, None, None, None), |g| {
+    let (
+        temperature,
+        top_p,
+        max_tokens,
+        stop,
+        seed,
+        frequency_penalty,
+        presence_penalty,
+        response_format,
+        thinking,
+    ) = req.generation_config.as_ref().map_or(
+        (None, None, None, None, None, None, None, None, None),
+        |g| {
             (
                 g.temperature,
                 g.top_p,
@@ -183,8 +206,11 @@ pub fn gemini_request_to_canonical(
                 g.seed,
                 g.frequency_penalty,
                 g.presence_penalty,
+                native_response_format(g),
+                native_thinking_to_canonical(g.thinking_config.as_ref()),
             )
-        });
+        },
+    );
 
     Ok(ChatRequest::builder()
         .model(req.model)
@@ -195,10 +221,213 @@ pub fn gemini_request_to_canonical(
         .maybe_stop(stop)
         .maybe_tools(tools)
         .maybe_tool_choice(tool_choice)
+        .maybe_response_format(response_format)
         .maybe_frequency_penalty(frequency_penalty)
         .maybe_presence_penalty(presence_penalty)
         .maybe_seed(seed)
+        .maybe_thinking(thinking)
         .build())
+}
+
+fn reject_unsupported_native_request_features(
+    req: &GenerateContentRequest,
+) -> Result<(), TranslateError> {
+    if req.cached_content.is_some() {
+        return Err(TranslateError::UnsupportedFeature {
+            provider: "canonical",
+            feature: "Gemini cachedContent cannot be represented for non-Gemini backends"
+                .to_owned(),
+        });
+    }
+
+    if req
+        .safety_settings
+        .as_ref()
+        .is_some_and(|settings| !settings.is_empty())
+    {
+        return Err(TranslateError::UnsupportedFeature {
+            provider: "canonical",
+            feature: "Gemini safetySettings cannot be represented for non-Gemini backends"
+                .to_owned(),
+        });
+    }
+
+    for tool in req.tools.iter().flatten() {
+        let unsupported = unsupported_native_tool_features(tool);
+        if !unsupported.is_empty() {
+            return Err(TranslateError::UnsupportedFeature {
+                provider: "canonical",
+                feature: format!(
+                    "Gemini built-in tool(s) cannot be represented for non-Gemini backends: {}",
+                    unsupported.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn unsupported_native_tool_features(tool: &crate::types::Tool) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    if tool.google_search.is_some() {
+        unsupported.push("googleSearch".to_owned());
+    }
+    if tool.code_execution.is_some() {
+        unsupported.push("codeExecution".to_owned());
+    }
+    if tool.url_context.is_some() {
+        unsupported.push("urlContext".to_owned());
+    }
+    unsupported.extend(tool.extra.keys().cloned());
+    unsupported
+}
+
+fn constrained_allowed_function_names(tool_config: Option<&ToolConfig>) -> Option<&[String]> {
+    let fcc = tool_config?.function_calling_config.as_ref()?;
+    match fcc.mode {
+        Some(FunctionCallingMode::Any | FunctionCallingMode::Validated) => fcc
+            .allowed_function_names
+            .as_deref()
+            .filter(|names| !names.is_empty()),
+        _ => None,
+    }
+}
+
+fn native_tool_choice_to_canonical(fcc: FunctionCallingConfig) -> ToolChoice {
+    match fcc.mode {
+        Some(FunctionCallingMode::None) => ToolChoice::Mode(ToolChoiceMode::None),
+        Some(FunctionCallingMode::Auto) | None => ToolChoice::Mode(ToolChoiceMode::Auto),
+        Some(FunctionCallingMode::Any) => match fcc.allowed_function_names.as_deref() {
+            Some([name]) => ToolChoice::Named(NamedToolChoice {
+                kind: "function".to_owned(),
+                function: NamedToolChoiceFunction {
+                    name: name.clone(),
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            }),
+            _ => ToolChoice::Mode(ToolChoiceMode::Required),
+        },
+        Some(FunctionCallingMode::Validated) => ToolChoice::Mode(ToolChoiceMode::Auto),
+        Some(FunctionCallingMode::Unknown(_)) => ToolChoice::Mode(ToolChoiceMode::Auto),
+    }
+}
+
+fn native_response_format(g: &GenerationConfig) -> Option<ResponseFormat> {
+    match g.response_mime_type.as_deref() {
+        Some("application/json") => {
+            if let Some(schema) = &g.response_schema {
+                Some(ResponseFormat::JsonSchema {
+                    json_schema: JsonSchema {
+                        name: "response".to_owned(),
+                        description: None,
+                        schema: Some(schema_types_to_canonical(schema)),
+                        strict: None,
+                        extra: Default::default(),
+                    },
+                    extra: Default::default(),
+                })
+            } else {
+                Some(ResponseFormat::JsonObject {
+                    extra: Default::default(),
+                })
+            }
+        }
+        Some("text/plain") => Some(ResponseFormat::Text {
+            extra: Default::default(),
+        }),
+        _ => None,
+    }
+}
+
+fn schema_types_to_canonical(schema: &Value) -> Value {
+    transform_schema_types(schema, |t| match t {
+        "OBJECT" => "object",
+        "STRING" => "string",
+        "NUMBER" => "number",
+        "INTEGER" => "integer",
+        "BOOLEAN" => "boolean",
+        "ARRAY" => "array",
+        "NULL" => "null",
+        other => other,
+    })
+}
+
+fn transform_schema_types(schema: &Value, map_type: fn(&str) -> &str) -> Value {
+    match schema {
+        Value::Object(obj) => {
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (key, value) in obj {
+                let mapped = if key == "type" {
+                    match value {
+                        Value::String(t) => Value::String(map_type(t).to_owned()),
+                        Value::Array(types) => Value::Array(
+                            types
+                                .iter()
+                                .map(|v| match v {
+                                    Value::String(t) => Value::String(map_type(t).to_owned()),
+                                    other => transform_schema_types(other, map_type),
+                                })
+                                .collect(),
+                        ),
+                        other => transform_schema_types(other, map_type),
+                    }
+                } else {
+                    transform_schema_types(value, map_type)
+                };
+                out.insert(key.clone(), mapped);
+            }
+            Value::Object(out)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|v| transform_schema_types(v, map_type))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn native_thinking_to_canonical(
+    thinking: Option<&NativeThinkingConfig>,
+) -> Option<ThinkingRequest> {
+    let thinking = thinking?;
+    if let Some(budget) = thinking.thinking_budget {
+        return match budget {
+            0 => Some(ThinkingRequest::Disabled),
+            -1 => Some(ThinkingRequest::Auto),
+            n if n > 0 => Some(ThinkingRequest::Budget {
+                budget_tokens: u32::try_from(n).unwrap_or(u32::MAX),
+            }),
+            _ => None,
+        };
+    }
+
+    thinking
+        .thinking_level
+        .as_ref()
+        .and_then(native_level_to_canonical)
+        .map(|level| ThinkingRequest::Level { level })
+}
+
+fn native_level_to_canonical(level: &NativeThinkingLevel) -> Option<CanonicalThinkingLevel> {
+    match level {
+        NativeThinkingLevel::Minimal => Some(CanonicalThinkingLevel::Minimal),
+        NativeThinkingLevel::Low => Some(CanonicalThinkingLevel::Low),
+        NativeThinkingLevel::Medium => Some(CanonicalThinkingLevel::Medium),
+        NativeThinkingLevel::High => Some(CanonicalThinkingLevel::High),
+        NativeThinkingLevel::Other(s) => match s.to_ascii_uppercase().as_str() {
+            "MINIMAL" => Some(CanonicalThinkingLevel::Minimal),
+            "LOW" => Some(CanonicalThinkingLevel::Low),
+            "MEDIUM" => Some(CanonicalThinkingLevel::Medium),
+            "HIGH" => Some(CanonicalThinkingLevel::High),
+            "XHIGH" | "X_HIGH" => Some(CanonicalThinkingLevel::XHigh),
+            "MAX" => Some(CanonicalThinkingLevel::Max),
+            _ => None,
+        },
+    }
 }
 
 fn native_role_to_canonical(role: Option<&NativeRole>) -> Role {
@@ -210,7 +439,37 @@ fn native_role_to_canonical(role: Option<&NativeRole>) -> Role {
     }
 }
 
-fn message_from_function_response(fr: FunctionResponse) -> Message {
+fn remember_pending_tool_calls(
+    tool_calls: &Option<Vec<ToolCall>>,
+    pending_tool_call_ids: &mut HashMap<String, VecDeque<String>>,
+) {
+    if let Some(tool_calls) = tool_calls {
+        for tool_call in tool_calls {
+            pending_tool_call_ids
+                .entry(tool_call.function.name.clone())
+                .or_default()
+                .push_back(tool_call.id.clone());
+        }
+    }
+}
+
+fn message_from_function_response(
+    fr: FunctionResponse,
+    pending_tool_call_ids: &mut HashMap<String, VecDeque<String>>,
+) -> Message {
+    let tool_call_id = match fr.id {
+        Some(id) => {
+            if let Some(ids) = pending_tool_call_ids.get_mut(&fr.name)
+                && let Some(pos) = ids.iter().position(|pending_id| pending_id == &id)
+            {
+                ids.remove(pos);
+            }
+            Some(id)
+        }
+        None => pending_tool_call_ids
+            .get_mut(&fr.name)
+            .and_then(VecDeque::pop_front),
+    };
     let content = match fr.response {
         Value::String(s) => s,
         v => v.to_string(),
@@ -219,7 +478,7 @@ fn message_from_function_response(fr: FunctionResponse) -> Message {
         role: Role::Tool,
         content: Some(MessageContent::Text(content)),
         name: Some(fr.name),
-        tool_call_id: fr.id,
+        tool_call_id,
         tool_calls: None,
         extra: Default::default(),
     }
@@ -239,12 +498,95 @@ fn partition_function_responses(parts: Vec<Part>) -> (Vec<FunctionResponse>, Vec
 }
 
 fn user_parts_to_content(parts: Vec<Part>) -> Option<MessageContent> {
-    let texts: Vec<String> = parts.into_iter().filter_map(|p| p.text).collect();
-    if texts.is_empty() {
-        None
-    } else {
-        Some(MessageContent::Text(texts.join("")))
+    let mut out = Vec::new();
+    let mut saw_non_text = false;
+    let mut text_pieces = Vec::new();
+
+    for part in parts {
+        let is_plain_text = part.text.is_some()
+            && part.inline_data.is_none()
+            && part.file_data.is_none()
+            && part.function_call.is_none()
+            && part.function_response.is_none()
+            && !part.thought.unwrap_or(false);
+
+        if is_plain_text {
+            let text = part.text.unwrap_or_default();
+            text_pieces.push(text.clone());
+            out.push(ForwardCompatible::Known(TypedContentPart::Text {
+                text,
+                extra: Default::default(),
+            }));
+            continue;
+        }
+
+        if let Some(content_part) = native_part_to_content_part(part) {
+            saw_non_text = true;
+            out.push(content_part);
+        }
     }
+
+    if out.is_empty() {
+        None
+    } else if saw_non_text {
+        Some(MessageContent::Parts(out))
+    } else {
+        Some(MessageContent::Text(text_pieces.join("")))
+    }
+}
+
+fn native_part_to_content_part(part: Part) -> Option<ContentPart> {
+    let is_thought = part.thought.unwrap_or(false);
+    if is_thought {
+        return Some(ForwardCompatible::Known(TypedContentPart::Thinking {
+            thinking: part.text.unwrap_or_default(),
+            signature: part.thought_signature.unwrap_or_default(),
+            source: Some(ThinkingSource::Gemini),
+            extra: Default::default(),
+        }));
+    }
+
+    if let Some(blob) = part.inline_data {
+        if blob.mime_type.starts_with("image/") {
+            return Some(ForwardCompatible::Known(TypedContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:{};base64,{}", blob.mime_type, blob.data),
+                    detail: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            }));
+        }
+        return Some(ForwardCompatible::Known(TypedContentPart::File {
+            file: json!({
+                "mime_type": blob.mime_type,
+                "data": blob.data,
+            }),
+            extra: Default::default(),
+        }));
+    }
+
+    if let Some(file) = part.file_data {
+        if file.mime_type.starts_with("image/") {
+            return Some(ForwardCompatible::Known(TypedContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: file.file_uri,
+                    detail: None,
+                    extra: Default::default(),
+                },
+                extra: Default::default(),
+            }));
+        }
+        return Some(ForwardCompatible::Known(TypedContentPart::File {
+            file: json!({
+                "mime_type": file.mime_type,
+                "file_uri": file.file_uri,
+            }),
+            extra: Default::default(),
+        }));
+    }
+
+    None
 }
 
 fn split_assistant_parts(parts: Vec<Part>) -> (Option<MessageContent>, Option<Vec<ToolCall>>) {
@@ -481,8 +823,8 @@ impl SseContext {
 /// differs from canonical streams in two ways:
 /// 1. Each chunk carries the full `functionCall` object — canonical
 ///    streams emit name and incremental args separately, so we buffer
-///    until a logical boundary (next tool call, finish, or the stream's
-///    `Done`) and flush as a single Gemini chunk.
+///    until a logical boundary (finish or the stream's `Done`) and flush
+///    as a single Gemini chunk.
 /// 2. Reasoning blocks have explicit start/end events on the canonical
 ///    side; on the Gemini side they're individual `thought=true` parts
 ///    with an optional `thoughtSignature`. We mirror Anthropic's bridge
@@ -560,23 +902,7 @@ pub fn stream_event_to_gemini_sse(event: &StreamEvent, ctx: &mut SseContext) -> 
 
         StreamEvent::Finish(reason) => {
             // Drain any pending tool-call buffers as Gemini functionCall parts.
-            let mut parts = Vec::new();
-            let mut indices: Vec<u32> = ctx.tool_calls.keys().copied().collect();
-            indices.sort_unstable();
-            for idx in indices {
-                if let Some(buf) = ctx.tool_calls.remove(&idx) {
-                    let args: Value = serde_json::from_str(&buf.arguments).unwrap_or(json!({}));
-                    parts.push(Part {
-                        function_call: Some(NativeFunctionCall {
-                            name: buf.name,
-                            args,
-                            id: Some(buf.id),
-                            extra: Default::default(),
-                        }),
-                        ..Default::default()
-                    });
-                }
-            }
+            let parts = drain_tool_call_parts(ctx);
             let native_reason = canonical_finish_to_native(reason.clone());
             Some(emit_chunk(ctx, parts, Some(native_reason), None))
         }
@@ -587,9 +913,39 @@ pub fn stream_event_to_gemini_sse(event: &StreamEvent, ctx: &mut SseContext) -> 
         }
 
         // Gemini's streamGenerateContent doesn't emit a [DONE] sentinel —
-        // the connection just closes. Suppress.
-        StreamEvent::Done => None,
+        // the connection just closes. If an upstream parser only surfaced
+        // tool-call deltas and then Done (with no Finish), flush the
+        // buffered functionCall parts before suppressing the sentinel.
+        StreamEvent::Done => {
+            let parts = drain_tool_call_parts(ctx);
+            if parts.is_empty() {
+                None
+            } else {
+                Some(emit_chunk(ctx, parts, None, None))
+            }
+        }
     }
+}
+
+fn drain_tool_call_parts(ctx: &mut SseContext) -> Vec<Part> {
+    let mut parts = Vec::new();
+    let mut indices: Vec<u32> = ctx.tool_calls.keys().copied().collect();
+    indices.sort_unstable();
+    for idx in indices {
+        if let Some(buf) = ctx.tool_calls.remove(&idx) {
+            let args: Value = serde_json::from_str(&buf.arguments).unwrap_or(json!({}));
+            parts.push(Part {
+                function_call: Some(NativeFunctionCall {
+                    name: buf.name,
+                    args,
+                    id: Some(buf.id),
+                    extra: Default::default(),
+                }),
+                ..Default::default()
+            });
+        }
+    }
+    parts
 }
 
 fn emit_chunk(
@@ -738,6 +1094,359 @@ mod tests {
         assert_eq!(msg.name.as_deref(), Some("get_weather"));
     }
 
+    #[test]
+    fn gemini_request_missing_function_response_id_reuses_pending_call_id() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![
+                Content {
+                    role: Some(NativeRole::Model),
+                    parts: vec![Part {
+                        function_call: Some(NativeFunctionCall {
+                            name: "get_weather".into(),
+                            args: json!({"location": "SF"}),
+                            id: None,
+                            extra: Default::default(),
+                        }),
+                        ..Default::default()
+                    }],
+                },
+                Content {
+                    role: Some(NativeRole::User),
+                    parts: vec![Part {
+                        function_response: Some(FunctionResponse {
+                            name: "get_weather".into(),
+                            response: json!({"temp": 72}),
+                            id: None,
+                            extra: Default::default(),
+                        }),
+                        ..Default::default()
+                    }],
+                },
+            ])
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        let call_id = canonical.messages[0].tool_calls.as_ref().unwrap()[0]
+            .id
+            .as_str();
+        assert_eq!(call_id, "call_0");
+        assert_eq!(canonical.messages[1].role, Role::Tool);
+        assert_eq!(canonical.messages[1].tool_call_id.as_deref(), Some(call_id));
+    }
+
+    #[test]
+    fn gemini_request_inline_image_becomes_image_url_part() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![
+                    Part::text("describe"),
+                    Part {
+                        inline_data: Some(crate::types::Blob {
+                            mime_type: "image/png".into(),
+                            data: "aW1n".into(),
+                            extra: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+            }])
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        let parts = match canonical.messages[0].content.as_ref().unwrap() {
+            MessageContent::Parts(parts) => parts,
+            other => panic!("expected Parts, got {other:?}"),
+        };
+        assert!(matches!(
+            &parts[0],
+            ContentPart::Known(TypedContentPart::Text { text, .. }) if text == "describe"
+        ));
+        assert!(matches!(
+            &parts[1],
+            ContentPart::Known(TypedContentPart::ImageUrl { image_url, .. })
+                if image_url.url == "data:image/png;base64,aW1n"
+        ));
+    }
+
+    #[test]
+    fn gemini_request_generation_config_maps_thinking_and_response_format() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("json please")],
+            }])
+            .generation_config(GenerationConfig {
+                thinking_config: Some(NativeThinkingConfig {
+                    thinking_budget: Some(-1),
+                    thinking_level: None,
+                    include_thoughts: Some(true),
+                }),
+                response_mime_type: Some("application/json".into()),
+                response_schema: Some(json!({
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": {"type": "STRING"}
+                    }
+                })),
+                ..Default::default()
+            })
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        assert_eq!(canonical.thinking, Some(ThinkingRequest::Auto));
+        match canonical.response_format.as_ref().unwrap() {
+            ResponseFormat::JsonSchema { json_schema, .. } => {
+                assert_eq!(json_schema.name, "response");
+                assert_eq!(
+                    json_schema.schema.as_ref().unwrap(),
+                    &json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        }
+                    })
+                );
+            }
+            other => panic!("expected JsonSchema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gemini_function_declaration_schema_becomes_canonical_json_schema() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("search")],
+            }])
+            .tools(vec![crate::types::Tool {
+                function_declarations: Some(vec![crate::types::FunctionDeclaration {
+                    name: "search".into(),
+                    description: Some("Search".into()),
+                    parameters: Some(json!({
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": {"type": "STRING"},
+                            "limit": {"type": ["INTEGER", "NULL"]}
+                        }
+                    })),
+                    extra: Default::default(),
+                }]),
+                google_search: None,
+                code_execution: None,
+                url_context: None,
+                extra: Default::default(),
+            }])
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        let params = canonical.tools.as_ref().unwrap()[0]
+            .function
+            .parameters
+            .as_ref()
+            .unwrap();
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["properties"]["query"]["type"], "string");
+        assert_eq!(
+            params["properties"]["limit"]["type"],
+            json!(["integer", "null"])
+        );
+    }
+
+    #[test]
+    fn gemini_request_thinking_level_maps_to_canonical_level() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-3-pro")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("hi")],
+            }])
+            .generation_config(GenerationConfig {
+                thinking_config: Some(NativeThinkingConfig {
+                    thinking_budget: None,
+                    thinking_level: Some(NativeThinkingLevel::High),
+                    include_thoughts: None,
+                }),
+                ..Default::default()
+            })
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        assert_eq!(
+            canonical.thinking,
+            Some(ThinkingRequest::Level {
+                level: CanonicalThinkingLevel::High
+            })
+        );
+    }
+
+    #[test]
+    fn gemini_request_single_allowed_tool_becomes_named_tool_choice() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("call a tool")],
+            }])
+            .tool_config(crate::types::ToolConfig {
+                function_calling_config: Some(FunctionCallingConfig {
+                    mode: Some(FunctionCallingMode::Any),
+                    allowed_function_names: Some(vec!["get_weather".into()]),
+                }),
+            })
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        assert!(matches!(
+            canonical.tool_choice,
+            Some(ToolChoice::Named(named)) if named.function.name == "get_weather"
+        ));
+    }
+
+    #[test]
+    fn gemini_request_multiple_allowed_tools_filters_declarations() {
+        let declarations = ["get_weather", "search", "delete_all"]
+            .into_iter()
+            .map(|name| crate::types::FunctionDeclaration {
+                name: name.to_owned(),
+                description: None,
+                parameters: None,
+                extra: Default::default(),
+            })
+            .collect();
+
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("call an allowed tool")],
+            }])
+            .tools(vec![crate::types::Tool {
+                function_declarations: Some(declarations),
+                google_search: None,
+                code_execution: None,
+                url_context: None,
+                extra: Default::default(),
+            }])
+            .tool_config(crate::types::ToolConfig {
+                function_calling_config: Some(FunctionCallingConfig {
+                    mode: Some(FunctionCallingMode::Any),
+                    allowed_function_names: Some(vec!["get_weather".into(), "search".into()]),
+                }),
+            })
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        assert!(matches!(
+            canonical.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::Required))
+        ));
+        let names: Vec<_> = canonical
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather", "search"]);
+    }
+
+    #[test]
+    fn gemini_request_validated_mode_stays_auto_but_filters_tools() {
+        let declarations = ["get_weather", "delete_all"]
+            .into_iter()
+            .map(|name| crate::types::FunctionDeclaration {
+                name: name.to_owned(),
+                description: None,
+                parameters: None,
+                extra: Default::default(),
+            })
+            .collect();
+
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("answer or call a tool")],
+            }])
+            .tools(vec![crate::types::Tool {
+                function_declarations: Some(declarations),
+                google_search: None,
+                code_execution: None,
+                url_context: None,
+                extra: Default::default(),
+            }])
+            .tool_config(crate::types::ToolConfig {
+                function_calling_config: Some(FunctionCallingConfig {
+                    mode: Some(FunctionCallingMode::Validated),
+                    allowed_function_names: Some(vec!["get_weather".into()]),
+                }),
+            })
+            .build();
+
+        let canonical = gemini_request_to_canonical(native).unwrap();
+        assert!(matches!(
+            canonical.tool_choice,
+            Some(ToolChoice::Mode(ToolChoiceMode::Auto))
+        ));
+        let names: Vec<_> = canonical
+            .tools
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_weather"]);
+    }
+
+    #[test]
+    fn gemini_request_builtin_tool_is_rejected_for_canonical_bridge() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("search")],
+            }])
+            .tools(vec![crate::types::Tool {
+                function_declarations: None,
+                google_search: Some(json!({})),
+                code_execution: None,
+                url_context: None,
+                extra: Default::default(),
+            }])
+            .build();
+
+        let err = gemini_request_to_canonical(native).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnsupportedFeature { feature, .. }
+                if feature.contains("googleSearch")
+        ));
+    }
+
+    #[test]
+    fn gemini_request_cached_content_is_rejected_for_canonical_bridge() {
+        let native = GenerateContentRequest::builder()
+            .model("gemini-2.5-flash")
+            .contents(vec![Content {
+                role: Some(NativeRole::User),
+                parts: vec![Part::text("use cache")],
+            }])
+            .cached_content("cachedContents/abc")
+            .build();
+
+        let err = gemini_request_to_canonical(native).unwrap_err();
+        assert!(matches!(
+            err,
+            TranslateError::UnsupportedFeature { feature, .. }
+                if feature.contains("cachedContent")
+        ));
+    }
+
     // ── chat_response_to_gemini ──────────────────────────────────────────
 
     #[test]
@@ -773,7 +1482,10 @@ mod tests {
         assert_eq!(gemini.model_version.as_deref(), Some("gpt-4"));
         assert_eq!(gemini.response_id.as_deref(), Some("chatcmpl-x"));
         let cand = &gemini.candidates[0];
-        assert_eq!(cand.content.as_ref().unwrap().parts[0].text.as_deref(), Some("Hi there!"));
+        assert_eq!(
+            cand.content.as_ref().unwrap().parts[0].text.as_deref(),
+            Some("Hi there!")
+        );
         assert_eq!(cand.finish_reason, Some(NativeFinishReason::Stop));
         let usage = gemini.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, Some(8));
@@ -838,9 +1550,8 @@ mod tests {
     #[test]
     fn content_delta_emits_text_part() {
         let mut ctx = SseContext::with_model("gemini-2.5-pro");
-        let out =
-            stream_event_to_gemini_sse(&StreamEvent::ContentDelta("Hello".into()), &mut ctx)
-                .unwrap();
+        let out = stream_event_to_gemini_sse(&StreamEvent::ContentDelta("Hello".into()), &mut ctx)
+            .unwrap();
         let v = extract_data(&out);
         assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "Hello");
         assert_eq!(v["modelVersion"], "gemini-2.5-pro");
@@ -856,13 +1567,14 @@ mod tests {
             },
             &mut ctx,
         );
-        let out = stream_event_to_gemini_sse(
-            &StreamEvent::ReasoningDelta("thinking".into()),
-            &mut ctx,
-        )
-        .unwrap();
+        let out =
+            stream_event_to_gemini_sse(&StreamEvent::ReasoningDelta("thinking".into()), &mut ctx)
+                .unwrap();
         let v = extract_data(&out);
-        assert_eq!(v["candidates"][0]["content"]["parts"][0]["text"], "thinking");
+        assert_eq!(
+            v["candidates"][0]["content"]["parts"][0]["text"],
+            "thinking"
+        );
         assert_eq!(v["candidates"][0]["content"]["parts"][0]["thought"], true);
     }
 
@@ -946,6 +1658,37 @@ mod tests {
     #[test]
     fn done_event_suppressed() {
         let mut ctx = SseContext::with_model("gemini-2.5-pro");
+        let out = stream_event_to_gemini_sse(&StreamEvent::Done, &mut ctx);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn done_event_flushes_pending_tool_call() {
+        let mut ctx = SseContext::with_model("gemini-2.5-pro");
+        stream_event_to_gemini_sse(
+            &StreamEvent::ToolCallStart {
+                index: 0,
+                id: "fc1".into(),
+                name: "get_weather".into(),
+            },
+            &mut ctx,
+        );
+        stream_event_to_gemini_sse(
+            &StreamEvent::ToolCallDelta {
+                index: 0,
+                arguments: r#"{"location":"SF"}"#.into(),
+            },
+            &mut ctx,
+        );
+
+        let out = stream_event_to_gemini_sse(&StreamEvent::Done, &mut ctx).unwrap();
+        let v = extract_data(&out);
+        let parts = v["candidates"][0]["content"]["parts"].as_array().unwrap();
+        let fc = &parts[0]["functionCall"];
+        assert_eq!(fc["id"], "fc1");
+        assert_eq!(fc["name"], "get_weather");
+        assert_eq!(fc["args"]["location"], "SF");
+
         let out = stream_event_to_gemini_sse(&StreamEvent::Done, &mut ctx);
         assert!(out.is_none());
     }

@@ -81,12 +81,7 @@ impl GeminiThinkingProjector {
 }
 
 impl ThinkingProjector<GeminiThinkingTarget> for GeminiThinkingProjector {
-    fn apply(
-        &self,
-        model: &str,
-        req: Option<&ThinkingRequest>,
-        target: &mut GeminiThinkingTarget,
-    ) {
+    fn apply(&self, model: &str, req: Option<&ThinkingRequest>, target: &mut GeminiThinkingTarget) {
         let Some(req) = req else { return };
         let g3 = (self.is_gemini_3_model)(model);
 
@@ -168,11 +163,7 @@ mod tests {
     #[test]
     fn disabled_sets_budget_zero() {
         let mut t = GeminiThinkingTarget::default();
-        projector().apply(
-            "gemini-2.5-flash",
-            Some(&ThinkingRequest::Disabled),
-            &mut t,
-        );
+        projector().apply("gemini-2.5-flash", Some(&ThinkingRequest::Disabled), &mut t);
         let c = t.config.unwrap();
         assert_eq!(c.thinking_budget, Some(0));
         assert!(c.thinking_level.is_none());

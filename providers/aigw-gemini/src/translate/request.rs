@@ -256,10 +256,10 @@ fn translate_messages(
     // Collect system text first.
     let mut system_texts: Vec<String> = Vec::new();
     for msg in messages {
-        if matches!(msg.role, Role::System | Role::Developer) {
-            if let Some(t) = extract_text(&msg.content) {
-                system_texts.push(t);
-            }
+        if matches!(msg.role, Role::System | Role::Developer)
+            && let Some(t) = extract_text(&msg.content)
+        {
+            system_texts.push(t);
         }
     }
     let system_instruction = if system_texts.is_empty() {
@@ -518,7 +518,7 @@ fn translate_tools_into_one(tools: &[Tool]) -> NativeTool {
         .map(|t| FunctionDeclaration {
             name: t.function.name.clone(),
             description: t.function.description.clone(),
-            parameters: t.function.parameters.clone(),
+            parameters: t.function.parameters.as_ref().map(schema_types_to_gemini),
             extra: serde_json::Map::new(),
         })
         .collect();
@@ -579,7 +579,7 @@ fn build_generation_config(
             }
             ResponseFormat::JsonSchema { json_schema, .. } => {
                 cfg.response_mime_type = Some("application/json".into());
-                cfg.response_schema = json_schema.schema.clone();
+                cfg.response_schema = json_schema.schema.as_ref().map(schema_types_to_gemini);
             }
         }
     }
@@ -618,6 +618,62 @@ fn generation_config_is_empty(cfg: &GenerationConfig) -> bool {
         && cfg.extra.is_empty()
 }
 
+fn schema_types_to_gemini(schema: &serde_json::Value) -> serde_json::Value {
+    transform_schema_types(schema, |t| match t {
+        "object" => "OBJECT",
+        "string" => "STRING",
+        "number" => "NUMBER",
+        "integer" => "INTEGER",
+        "boolean" => "BOOLEAN",
+        "array" => "ARRAY",
+        "null" => "NULL",
+        other => other,
+    })
+}
+
+fn transform_schema_types(
+    schema: &serde_json::Value,
+    map_type: fn(&str) -> &str,
+) -> serde_json::Value {
+    match schema {
+        serde_json::Value::Object(obj) => {
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (key, value) in obj {
+                let mapped = if key == "type" {
+                    match value {
+                        serde_json::Value::String(t) => {
+                            serde_json::Value::String(map_type(t).to_owned())
+                        }
+                        serde_json::Value::Array(types) => serde_json::Value::Array(
+                            types
+                                .iter()
+                                .map(|v| match v {
+                                    serde_json::Value::String(t) => {
+                                        serde_json::Value::String(map_type(t).to_owned())
+                                    }
+                                    other => transform_schema_types(other, map_type),
+                                })
+                                .collect(),
+                        ),
+                        other => transform_schema_types(other, map_type),
+                    }
+                } else {
+                    transform_schema_types(value, map_type)
+                };
+                out.insert(key.clone(), mapped);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| transform_schema_types(v, map_type))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +681,7 @@ mod tests {
         ChatRequest, FunctionCall, FunctionDefinition, ImageUrl, JsonSchema, Message,
         MessageContent, ThinkingLevel, ThinkingRequest,
     };
+    use serde_json::json;
 
     fn user_msg(text: &str) -> Message {
         Message {
@@ -690,11 +747,7 @@ mod tests {
     fn translator_attaches_api_key_header() {
         let t = translator();
         assert_eq!(
-            t.headers
-                .get("x-goog-api-key")
-                .unwrap()
-                .to_str()
-                .unwrap(),
+            t.headers.get("x-goog-api-key").unwrap().to_str().unwrap(),
             "AIza-test"
         );
     }
@@ -838,7 +891,13 @@ mod tests {
                 function: FunctionDefinition {
                     name: "search".into(),
                     description: Some("Search the web".into()),
-                    parameters: Some(serde_json::json!({"type":"object"})),
+                    parameters: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "limit": {"type": ["integer", "null"]}
+                        }
+                    })),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -852,6 +911,13 @@ mod tests {
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name, "search");
         assert_eq!(decls[0].description.as_deref(), Some("Search the web"));
+        let params = decls[0].parameters.as_ref().unwrap();
+        assert_eq!(params["type"], "OBJECT");
+        assert_eq!(params["properties"]["query"]["type"], "STRING");
+        assert_eq!(
+            params["properties"]["limit"]["type"],
+            json!(["INTEGER", "NULL"])
+        );
     }
 
     #[test]
@@ -927,7 +993,12 @@ mod tests {
                 json_schema: JsonSchema {
                     name: "person".into(),
                     description: None,
-                    schema: Some(serde_json::json!({"type":"object"})),
+                    schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        }
+                    })),
                     strict: None,
                     extra: Default::default(),
                 },
@@ -937,7 +1008,9 @@ mod tests {
         let body = translate(&req);
         let cfg = body.generation_config.unwrap();
         assert_eq!(cfg.response_mime_type.as_deref(), Some("application/json"));
-        assert_eq!(cfg.response_schema.unwrap()["type"], "object");
+        let schema = cfg.response_schema.unwrap();
+        assert_eq!(schema["type"], "OBJECT");
+        assert_eq!(schema["properties"]["name"]["type"], "STRING");
     }
 
     #[test]
@@ -979,10 +1052,7 @@ mod tests {
         let cfg = body.generation_config.unwrap();
         let tc = cfg.thinking_config.unwrap();
         assert!(tc.thinking_budget.is_none());
-        assert_eq!(
-            tc.thinking_level,
-            Some(crate::types::ThinkingLevel::High)
-        );
+        assert_eq!(tc.thinking_level, Some(crate::types::ThinkingLevel::High));
     }
 
     #[test]

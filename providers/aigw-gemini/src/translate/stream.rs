@@ -291,8 +291,14 @@ mod tests {
             "candidates": [{ "content": { "role": "model", "parts": [{"text":"world"}] } }]
         }"#;
         let e2 = p.parse_event("", chunk2).unwrap();
-        assert!(e1.iter().any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "Hello ")));
-        assert!(e2.iter().any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "world")));
+        assert!(
+            e1.iter()
+                .any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "Hello "))
+        );
+        assert!(
+            e2.iter()
+                .any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "world"))
+        );
     }
 
     #[test]
@@ -307,10 +313,26 @@ mod tests {
             "usageMetadata": { "promptTokenCount": 5, "candidatesTokenCount": 2, "totalTokenCount": 7 }
         }"#;
         let events = p.parse_event("", chunk).unwrap();
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ResponseMeta { .. })));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "done.")));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::Finish(FinishReason::Stop))));
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::Usage(u) if u.prompt_tokens == Some(5))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ResponseMeta { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ContentDelta(s) if s == "done."))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Finish(FinishReason::Stop)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Usage(u) if u.prompt_tokens == Some(5)))
+        );
         assert!(events.iter().any(|e| matches!(e, StreamEvent::Done)));
     }
 
