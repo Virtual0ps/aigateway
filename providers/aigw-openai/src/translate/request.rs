@@ -7,10 +7,12 @@ use std::collections::BTreeMap;
 
 use aigw_core::error::TranslateError;
 use aigw_core::model::ChatRequest;
-use aigw_core::translate::{RequestTranslator, TranslatedRequest};
+use aigw_core::translate::{RequestTranslator, ThinkingProjector, TranslatedRequest};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use serde_json::Value;
 
+use super::chat_thinking::{OpenAIChatThinkingProjector, OpenAIChatThinkingTarget};
 use crate::transport::OpenAITransport;
 
 /// Translates canonical requests into OpenAI Chat Completions API requests.
@@ -19,17 +21,56 @@ use crate::transport::OpenAITransport;
 /// is cloned at construction time, so the translator is self-contained.
 pub struct OpenAIRequestTranslator {
     transport: OpenAITransport,
+    thinking: Box<dyn ThinkingProjector<OpenAIChatThinkingTarget>>,
 }
 
 impl OpenAIRequestTranslator {
     pub fn new(transport: OpenAITransport) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            thinking: Box::new(OpenAIChatThinkingProjector::default()),
+        }
+    }
+
+    /// Replace the thinking projector. Use a custom
+    /// [`OpenAIChatThinkingProjector`] (different budget thresholds) or
+    /// any other implementation of
+    /// [`ThinkingProjector<OpenAIChatThinkingTarget>`].
+    #[must_use]
+    pub fn with_thinking_projector(
+        mut self,
+        projector: Box<dyn ThinkingProjector<OpenAIChatThinkingTarget>>,
+    ) -> Self {
+        self.thinking = projector;
+        self
+    }
+
+    /// Serialise `req` to a JSON value, project canonical thinking onto
+    /// the wire body (`reasoning_effort` field), and strip the
+    /// canonical-only `thinking` field.
+    fn build_body(&self, req: &ChatRequest) -> Result<Value, TranslateError> {
+        let mut body = serde_json::to_value(req)?;
+        let mut target = OpenAIChatThinkingTarget::default();
+        if req.thinking.is_some() {
+            self.thinking
+                .apply(&req.model, req.thinking.as_ref(), &mut target);
+        }
+        if let Some(obj) = body.as_object_mut() {
+            // Canonical-only — never sent on the wire.
+            obj.remove("thinking");
+            if target.disable {
+                obj.remove("reasoning_effort");
+            } else if let Some(effort) = target.reasoning_effort {
+                obj.insert("reasoning_effort".into(), Value::String(effort));
+            }
+        }
+        Ok(body)
     }
 }
 
 impl RequestTranslator for OpenAIRequestTranslator {
     fn translate_request(&self, req: &ChatRequest) -> Result<TranslatedRequest, TranslateError> {
-        let body = serde_json::to_vec(req)?;
+        let body = serde_json::to_vec(&self.build_body(req)?)?;
         let transport_req = self
             .transport
             .prepare_json_request("/chat/completions", &BTreeMap::new());
@@ -47,8 +88,9 @@ impl RequestTranslator for OpenAIRequestTranslator {
         &self,
         req: &ChatRequest,
     ) -> Result<TranslatedRequest, TranslateError> {
-        // Serialize to a mutable JSON value so we can inject stream fields.
-        let mut json = serde_json::to_value(req)?;
+        // Serialize to a mutable JSON value so we can inject stream fields
+        // and project canonical thinking onto reasoning_effort.
+        let mut json = self.build_body(req)?;
         if let Some(obj) = json.as_object_mut() {
             obj.insert("stream".into(), serde_json::Value::Bool(true));
             obj.insert(

@@ -10,6 +10,7 @@
 //!   Responses API format (`/v1/responses`). Messages → input items, system →
 //!   instructions, tool definitions restructured.
 
+mod chat_thinking;
 mod request;
 mod response;
 mod responses_request;
@@ -18,6 +19,9 @@ pub(crate) mod responses_stream;
 mod responses_thinking;
 mod stream;
 
+pub use chat_thinking::{
+    OpenAIChatThinkingProjector, OpenAIChatThinkingTarget, apply_thinking_to_chat_body,
+};
 pub use request::OpenAIRequestTranslator;
 pub use response::OpenAIResponseTranslator;
 pub use responses_request::{
