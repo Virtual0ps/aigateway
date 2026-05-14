@@ -65,7 +65,10 @@ pub enum StreamEvent {
     ///
     /// Deprecated in favor of [`StreamEvent::ReasoningEnd`], which also
     /// carries the block index. Kept for parsers that haven't migrated yet.
-    #[deprecated(since = "0.5.0", note = "use ReasoningEnd { index, signature } instead")]
+    #[deprecated(
+        since = "0.5.0",
+        note = "use ReasoningEnd { index, signature } instead"
+    )]
     ReasoningSignature(String),
 
     /// A new tool call begins.

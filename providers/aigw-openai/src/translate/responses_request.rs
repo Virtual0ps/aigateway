@@ -748,20 +748,15 @@ fn normalize_web_search_tool_choice(tc: ResponseToolChoice) -> ResponseToolChoic
                     // Rewrite nested tools array if present.
                     if let Some(Value::Array(tools)) = obj.get_mut("tools") {
                         for tool in tools.iter_mut() {
-                            if let Value::Object(tool_obj) = tool {
-                                if let Some(tool_type) =
+                            if let Value::Object(tool_obj) = tool
+                                && let Some(tool_type) =
                                     tool_obj.get("type").and_then(Value::as_str)
-                                {
-                                    if matches!(
-                                        tool_type,
-                                        "web_search_preview" | "web_search_preview_2025_03_11"
-                                    ) {
-                                        tool_obj.insert(
-                                            "type".into(),
-                                            Value::String("web_search".into()),
-                                        );
-                                    }
-                                }
+                                && matches!(
+                                    tool_type,
+                                    "web_search_preview" | "web_search_preview_2025_03_11"
+                                )
+                            {
+                                tool_obj.insert("type".into(), Value::String("web_search".into()));
                             }
                         }
                     }
@@ -1366,7 +1361,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({"type": "web_search_preview"})).unwrap(),
         ));
         let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
-        let serialized = serde_json::to_value(&resp.tool_choice.unwrap()).unwrap();
+        let serialized = serde_json::to_value(resp.tool_choice.unwrap()).unwrap();
         assert_eq!(serialized["type"], "web_search");
     }
 
@@ -1385,7 +1380,7 @@ mod tests {
             .unwrap(),
         ));
         let resp = chat_request_to_responses(&req, &codex_config()).unwrap();
-        let serialized = serde_json::to_value(&resp.tool_choice.unwrap()).unwrap();
+        let serialized = serde_json::to_value(resp.tool_choice.unwrap()).unwrap();
         assert_eq!(serialized["type"], "allowed_tools");
         assert_eq!(serialized["tools"][0]["type"], "web_search");
         assert_eq!(serialized["tools"][1]["type"], "web_search");

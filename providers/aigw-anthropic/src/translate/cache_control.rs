@@ -131,15 +131,15 @@ pub fn ephemeral_marker_with_ttl(ttl_seconds: u64) -> CacheControl {
 // ─── Idempotency check ──────────────────────────────────────────────────────
 
 fn has_any_cache_control(req: &MessagesRequest) -> bool {
-    if let Some(tools) = &req.tools {
-        if tools.iter().any(|t| t.cache_control.is_some()) {
-            return true;
-        }
+    if let Some(tools) = &req.tools
+        && tools.iter().any(|t| t.cache_control.is_some())
+    {
+        return true;
     }
-    if let Some(SystemPrompt::Blocks(blocks)) = &req.system {
-        if blocks.iter().any(|b| b.cache_control.is_some()) {
-            return true;
-        }
+    if let Some(SystemPrompt::Blocks(blocks)) = &req.system
+        && blocks.iter().any(|b| b.cache_control.is_some())
+    {
+        return true;
     }
     for msg in &req.messages {
         if let MessageContent::Blocks(blocks) = &msg.content {
@@ -197,7 +197,9 @@ fn inject_system_cache(req: &mut MessagesRequest, marker: &CacheControl) {
             // Promote string → blocks so we have somewhere to attach
             // cache_control. Empty strings are left alone (no point
             // caching nothing).
-            let SystemPrompt::Text(text) = sp else { unreachable!() };
+            let SystemPrompt::Text(text) = sp else {
+                unreachable!()
+            };
             if text.is_empty() {
                 return;
             }

@@ -306,11 +306,7 @@ mod tests {
             output_config_effort: Some("high"),
             ..Default::default()
         };
-        projector().apply(
-            "claude-opus-4-6",
-            Some(&ThinkingRequest::Disabled),
-            &mut t,
-        );
+        projector().apply("claude-opus-4-6", Some(&ThinkingRequest::Disabled), &mut t);
         assert!(matches!(t.thinking, Some(ThinkingConfig::Disabled)));
         assert!(t.clear_output_config);
     }

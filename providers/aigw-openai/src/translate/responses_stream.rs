@@ -75,21 +75,19 @@ impl StreamParser for ResponsesStreamParser {
         let mut events = Vec::new();
 
         match event_type {
-            "response.created" => {
-                if !self.meta_emitted {
-                    let id = ev
-                        .pointer("/response/id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    let model = ev
-                        .pointer("/response/model")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_owned();
-                    events.push(StreamEvent::ResponseMeta { id, model });
-                    self.meta_emitted = true;
-                }
+            "response.created" if !self.meta_emitted => {
+                let id = ev
+                    .pointer("/response/id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let model = ev
+                    .pointer("/response/model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                events.push(StreamEvent::ResponseMeta { id, model });
+                self.meta_emitted = true;
             }
 
             // ── Reasoning events ────────────────────────────────────────
@@ -291,7 +289,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            StreamEvent::ReasoningStart { index: 0, source: Some(ThinkingSource::OpenaiResponses) }
+            StreamEvent::ReasoningStart {
+                index: 0,
+                source: Some(ThinkingSource::OpenaiResponses)
+            }
         ));
 
         let done = r#"{
@@ -345,42 +346,27 @@ mod tests {
             "item":{"type":"reasoning","encrypted_content":"s1"}
         }"#;
         let e = p.parse_event("", r1).unwrap();
-        assert!(matches!(
-            e[0],
-            StreamEvent::ReasoningStart { index: 0, .. }
-        ));
+        assert!(matches!(e[0], StreamEvent::ReasoningStart { index: 0, .. }));
         let d1 = r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#;
         let e = p.parse_event("", d1).unwrap();
-        assert!(matches!(
-            e[0],
-            StreamEvent::ReasoningEnd { index: 0, .. }
-        ));
+        assert!(matches!(e[0], StreamEvent::ReasoningEnd { index: 0, .. }));
 
         let r2 = r#"{
             "type":"response.output_item.added",
             "item":{"type":"reasoning","encrypted_content":"s2"}
         }"#;
         let e = p.parse_event("", r2).unwrap();
-        assert!(matches!(
-            e[0],
-            StreamEvent::ReasoningStart { index: 1, .. }
-        ));
+        assert!(matches!(e[0], StreamEvent::ReasoningStart { index: 1, .. }));
         let d2 = r#"{"type":"response.output_item.done","item":{"type":"reasoning"}}"#;
         let e = p.parse_event("", d2).unwrap();
-        assert!(matches!(
-            e[0],
-            StreamEvent::ReasoningEnd { index: 1, .. }
-        ));
+        assert!(matches!(e[0], StreamEvent::ReasoningEnd { index: 1, .. }));
 
         let tc = r#"{
             "type":"response.output_item.added",
             "item":{"type":"function_call","call_id":"c1","name":"f"}
         }"#;
         let e = p.parse_event("", tc).unwrap();
-        assert!(matches!(
-            e[0],
-            StreamEvent::ToolCallStart { index: 0, .. }
-        ));
+        assert!(matches!(e[0], StreamEvent::ToolCallStart { index: 0, .. }));
     }
 
     #[test]

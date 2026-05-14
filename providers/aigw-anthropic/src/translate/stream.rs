@@ -413,7 +413,10 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
-            CanonicalStreamEvent::ReasoningStart { index: 0, source: Some(ThinkingSource::Anthropic) }
+            CanonicalStreamEvent::ReasoningStart {
+                index: 0,
+                source: Some(ThinkingSource::Anthropic)
+            }
         ));
 
         // thinking_delta → ReasoningDelta
@@ -505,7 +508,10 @@ mod tests {
             "content_block":{"type":"redacted_thinking","data":"blob"}
         }"#;
         let e = p.parse_event("", start).unwrap();
-        assert!(e.is_empty(), "redacted_thinking is currently skipped in stream");
+        assert!(
+            e.is_empty(),
+            "redacted_thinking is currently skipped in stream"
+        );
 
         let stop = r#"{"type":"content_block_stop","index":0}"#;
         let e = p.parse_event("", stop).unwrap();

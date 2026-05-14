@@ -66,10 +66,7 @@ impl AnthropicRequestTranslator {
     /// disable automatic injection while still keeping the always-on
     /// 4-breakpoint cap and TTL ordering enforcement.
     #[must_use]
-    pub fn with_cache_control_strategy(
-        mut self,
-        strategy: Box<dyn CacheControlStrategy>,
-    ) -> Self {
+    pub fn with_cache_control_strategy(mut self, strategy: Box<dyn CacheControlStrategy>) -> Self {
         self.cache_control = strategy;
         self
     }
