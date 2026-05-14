@@ -7,6 +7,12 @@ name = "aigateway"
 version = "0.4.0"
 dependencies = [
  "aigw",
+ "aigw-core",
+ "futures-util",
+ "reqwest",
+ "secrecy",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
