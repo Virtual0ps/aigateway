@@ -51,35 +51,72 @@ const STREAM_SSE_NO_DONE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"c
 
 const UNARY_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}"#;
 
+/// OpenAI Responses API streaming SSE: text delta then a tool call, closed by
+/// `response.completed` + `[DONE]`.
+const RESPONSES_STREAM_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_mock\",\"model\":\"gpt-4.1\"}}\n\n",
+    "event: response.output_text.delta\n",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n",
+    "event: response.output_item.added\n",
+    "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"get_weather\"}}\n\n",
+    "event: response.function_call_arguments.delta\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"location\\\":\\\"SF\\\"}\"}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18}}}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const RESPONSES_UNARY_JSON: &str = r#"{"id":"resp_mock","object":"response","model":"gpt-4.1","status":"completed","output":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hi there!"}]}],"usage":{"input_tokens":8,"output_tokens":4,"total_tokens":12}}"#;
+
+/// Record the model + auth header the gateway sent, and return whether the
+/// request asked for streaming.
+fn record(state: &MockState, headers: &axum::http::HeaderMap, body: &Bytes) -> bool {
+    let v: Value = serde_json::from_slice(body).expect("upstream body is JSON");
+    let mut rec = state.recorder.lock().unwrap();
+    rec.model = v["model"].as_str().map(str::to_owned);
+    rec.authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned);
+    v["stream"].as_bool().unwrap_or(false)
+}
+
+fn sse_response(body: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+}
+
+fn json_response(body: &'static str) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 async fn chat_completions(
     State(state): State<Arc<MockState>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let v: Value = serde_json::from_slice(&body).expect("upstream body is JSON");
-    {
-        let mut rec = state.recorder.lock().unwrap();
-        rec.model = v["model"].as_str().map(str::to_owned);
-        rec.authorization = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-            .map(str::to_owned);
-    }
-
-    if v["stream"].as_bool().unwrap_or(false) {
-        (
-            [(header::CONTENT_TYPE, "text/event-stream")],
-            state.stream_body,
-        )
-            .into_response()
+    if record(&state, &headers, &body) {
+        sse_response(state.stream_body)
     } else {
-        ([(header::CONTENT_TYPE, "application/json")], UNARY_JSON).into_response()
+        json_response(UNARY_JSON)
     }
 }
 
-/// Bind a mock OpenAI-compatible upstream on loopback, serving `stream_body`
-/// for streaming requests. Returns its base URL (with the `/v1` prefix the
-/// gateway appends `/chat/completions` to) and the request recorder.
+async fn responses(
+    State(state): State<Arc<MockState>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    if record(&state, &headers, &body) {
+        sse_response(RESPONSES_STREAM_SSE)
+    } else {
+        json_response(RESPONSES_UNARY_JSON)
+    }
+}
+
+/// Bind a mock OpenAI-compatible upstream on loopback (both `/chat/completions`
+/// and `/responses`), serving `stream_body` for chat streaming requests.
+/// Returns its base URL (with the `/v1` prefix) and the request recorder.
 async fn spawn_mock_upstream(stream_body: &'static str) -> (String, Recorder) {
     let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
     let state = Arc::new(MockState {
@@ -88,6 +125,7 @@ async fn spawn_mock_upstream(stream_body: &'static str) -> (String, Recorder) {
     });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -97,17 +135,18 @@ async fn spawn_mock_upstream(stream_body: &'static str) -> (String, Recorder) {
     (format!("http://{addr}/v1"), recorder)
 }
 
-/// Bind the real gateway on loopback, pointing at `upstream_base`. Returns the
+/// Bind the real gateway on loopback with the given upstream wire. Returns the
 /// gateway's base URL.
-async fn spawn_gateway(upstream_base: String) -> String {
+async fn spawn_gateway(upstream_base: String, wire: Wire) -> String {
     let config = UpstreamConfig {
         base_url: upstream_base,
         api_key: SecretString::from("sk-upstream"),
-        wire: Wire::OpenaiChat,
+        wire,
         timeout_seconds: None,
         default_headers: BTreeMap::new(),
         models: BTreeMap::from([("claude-sonnet-4-20250514".to_owned(), "gpt-4.1".to_owned())]),
         default_model: None,
+        proxy: None,
     };
     let upstream = Upstream::new(config).unwrap();
     let state = AppState::new(upstream);
@@ -150,7 +189,7 @@ fn client() -> reqwest::Client {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_with_tools_produces_anthropic_sse() {
     let (upstream_base, recorder) = spawn_mock_upstream(STREAM_SSE).await;
-    let gateway = spawn_gateway(upstream_base).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -228,7 +267,7 @@ async fn streaming_with_tools_produces_anthropic_sse() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unary_produces_anthropic_message() {
     let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
-    let gateway = spawn_gateway(upstream_base).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -261,7 +300,7 @@ async fn streaming_without_done_still_terminates() {
     // `[DONE]`. The gateway must still emit a terminal message_delta +
     // message_stop so the client doesn't hang.
     let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE_NO_DONE).await;
-    let gateway = spawn_gateway(upstream_base).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
 
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -298,9 +337,94 @@ async fn streaming_without_done_still_terminates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_streaming_with_tools_produces_anthropic_sse() {
+    // stream_body is only used by the chat route; the responses route serves
+    // RESPONSES_STREAM_SSE.
+    let (upstream_base, recorder) = spawn_mock_upstream(STREAM_SSE).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiResponses).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 256,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "What's the weather in SF?" }],
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the weather",
+            "input_schema": { "type": "object", "properties": { "location": { "type": "string" } } }
+        }]
+    });
+
+    let resp = client()
+        .post(format!("{gateway}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let text = resp.text().await.unwrap();
+    let frames = parse_sse(&text);
+    let names: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ],
+        "unexpected frame sequence: {names:?}"
+    );
+    assert_eq!(frames[2].1["delta"]["text"], "Hello");
+    assert_eq!(frames[4].1["content_block"]["type"], "tool_use");
+    assert_eq!(frames[4].1["content_block"]["name"], "get_weather");
+    assert_eq!(frames[5].1["delta"]["partial_json"], r#"{"location":"SF"}"#);
+    assert_eq!(frames[7].1["delta"]["stop_reason"], "tool_use");
+    assert_eq!(frames[7].1["usage"]["input_tokens"], 11);
+    assert_eq!(frames[7].1["usage"]["output_tokens"], 7);
+
+    // The gateway hit the Responses endpoint with the mapped model + upstream key.
+    let rec = recorder.lock().unwrap();
+    assert_eq!(rec.model.as_deref(), Some("gpt-4.1"));
+    assert_eq!(rec.authorization.as_deref(), Some("Bearer sk-upstream"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_unary_produces_anthropic_message() {
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiResponses).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 256,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+
+    let resp = client()
+        .post(format!("{gateway}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["type"], "message");
+    assert_eq!(v["content"][0]["text"], "Hi there!");
+    assert_eq!(v["stop_reason"], "end_turn");
+    assert_eq!(v["usage"]["input_tokens"], 8);
+    assert_eq!(v["usage"]["output_tokens"], 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_check_ok() {
     let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
-    let gateway = spawn_gateway(upstream_base).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
 
     let resp = client()
         .get(format!("{gateway}/health"))

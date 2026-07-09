@@ -54,8 +54,9 @@ Full:
 [upstream]
 base_url        = "https://api.openai.com/v1"
 api_key         = "sk-..."
-wire            = "openai-chat"   # "openai-chat" (default) | "openai-responses" (not yet supported)
+wire            = "openai-chat"   # "openai-chat" (default) | "openai-responses"
 timeout_seconds = 600             # idle read timeout; long streams are never cut
+# proxy         = "http://127.0.0.1:8888"   # route upstream traffic via a proxy
 
 # Map inbound (Anthropic) model names → upstream model names.
 [upstream.models]
@@ -73,12 +74,13 @@ x-custom-header = "value"
 
 | Field                    | Required | Notes                                                             |
 | ------------------------ | -------- | ---------------------------------------------------------------- |
-| `upstream.base_url`      | yes      | OpenAI-compatible base; `/chat/completions` is appended.         |
+| `upstream.base_url`      | yes      | OpenAI-compatible base; `/chat/completions` or `/responses` is appended. |
 | `upstream.api_key`       | yes      | Injected as `Authorization: Bearer <key>`. Redacted in logs.    |
-| `upstream.wire`          | no       | Only `openai-chat` is implemented today.                         |
+| `upstream.wire`          | no       | `openai-chat` (default) or `openai-responses`.                   |
 | `upstream.timeout_seconds` | no     | Idle read timeout (default 600s), not a total-request timeout.   |
 | `upstream.models`        | no       | Inbound → upstream model name map.                               |
 | `upstream.default_model` | no       | Fallback upstream model; passthrough if unset.                   |
+| `upstream.proxy`         | no       | Proxy URL for upstream traffic; direct (bypasses system proxy) if unset. |
 | `upstream.default_headers` | no     | Extra upstream request headers.                                  |
 
 ## Endpoints
@@ -108,15 +110,16 @@ bind loopback; do not expose this endpoint to a network.
 
 ## Behavior notes
 
-- **Networking** — the outbound HTTP client bypasses the system proxy
-  (`no_proxy`), so a loopback sidecar always talks directly to its configured
-  upstream (important for `localhost` model servers). Explicit proxy support can
-  be added as a config knob if needed.
-- **Token accounting** — OpenAI-style upstreams report usage only at the end of
-  a stream, after `message_start` has already been sent. So streaming
-  `message_start.usage.input_tokens` is `0`; the real input/output token counts
-  arrive in the terminal `message_delta.usage`. Unary responses carry full
-  usage.
+- **Networking** — by default the outbound HTTP client bypasses the system
+  proxy, so a loopback sidecar talks directly to its configured upstream
+  (important for `localhost` model servers). Set `upstream.proxy` to route
+  upstream traffic through an explicit proxy instead.
+- **Token accounting** — OpenAI-style upstreams (both wires) report usage only
+  at the end of a stream, after `message_start` has already been sent. So
+  streaming `message_start.usage.input_tokens` is `0`; the real input/output
+  counts — plus `cache_read_input_tokens` when the upstream reports cache hits —
+  arrive in the terminal `message_delta.usage`, which Claude Code reads. Unary
+  responses carry full usage directly.
 - **Response `model`** — the response echoes the upstream model name (what
   actually served the request), not the requested Anthropic model name.
 

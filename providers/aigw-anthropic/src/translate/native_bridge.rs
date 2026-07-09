@@ -726,21 +726,17 @@ impl SseContext {
             .finish_reason
             .clone()
             .map_or(StopReason::EndTurn, StopReason::from);
-        let (input_tokens, output_tokens) = self.usage.as_ref().map_or((0, 0), |u| {
-            (
-                u.prompt_tokens.unwrap_or(0),
-                u.completion_tokens.unwrap_or(0),
-            )
-        });
         out.push(AnthropicSseFrame::new(
             "message_delta",
             json!({
                 "type": "message_delta",
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                // `output_tokens` is what Anthropic clients read for accounting;
-                // `input_tokens` is included here because OpenAI-style upstreams
-                // only report it at end-of-stream (too late for message_start).
-                "usage": { "input_tokens": input_tokens, "output_tokens": output_tokens },
+                // The terminal `message_delta` carries the full, real usage.
+                // OpenAI-style upstreams only report token counts at
+                // end-of-stream — too late for `message_start` — but Anthropic
+                // clients (Claude Code) read `input_tokens` from here too, so
+                // this is where accurate accounting lands.
+                "usage": streaming_usage_json(self.usage.as_ref()),
             }),
         ));
         out.push(AnthropicSseFrame::new(
@@ -748,6 +744,57 @@ impl SseContext {
             json!({ "type": "message_stop" }),
         ));
     }
+}
+
+/// Build the Anthropic streaming `usage` object from canonical usage.
+///
+/// Always carries `input_tokens` + `output_tokens`, plus
+/// `cache_read_input_tokens` / `cache_creation_input_tokens` when the upstream
+/// reported them (OpenAI Chat surfaces cache hits as
+/// `prompt_tokens_details.cached_tokens`; the Responses API as
+/// `input_tokens_details`).
+fn streaming_usage_json(usage: Option<&Usage>) -> Value {
+    let mut obj = serde_json::Map::new();
+    let (input, output) = usage.map_or((0, 0), |u| {
+        (
+            u.prompt_tokens.unwrap_or(0),
+            u.completion_tokens.unwrap_or(0),
+        )
+    });
+    obj.insert("input_tokens".to_owned(), Value::from(input));
+    obj.insert("output_tokens".to_owned(), Value::from(output));
+    if let Some(usage) = usage {
+        if let Some(read) = cache_read_tokens(usage) {
+            obj.insert("cache_read_input_tokens".to_owned(), Value::from(read));
+        }
+        if let Some(creation) = usage
+            .extra
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            obj.insert(
+                "cache_creation_input_tokens".to_owned(),
+                Value::from(creation),
+            );
+        }
+    }
+    Value::Object(obj)
+}
+
+/// Extract cache-read (cache-hit) input tokens from canonical usage, checking
+/// the Anthropic-style key first, then OpenAI's `prompt_tokens_details`.
+fn cache_read_tokens(usage: &Usage) -> Option<u64> {
+    usage
+        .extra
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .extra
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(Value::as_u64)
+        })
 }
 
 /// Convert a single canonical [`StreamEvent`] into zero or more Anthropic SSE
@@ -1391,6 +1438,39 @@ mod tests {
                 "message_stop",
             ]
         );
+    }
+
+    #[test]
+    fn streaming_usage_carries_input_and_cache_tokens() {
+        let mut ctx = SseContext::default();
+        feed(
+            &mut ctx,
+            StreamEvent::ResponseMeta {
+                id: "m".into(),
+                model: "m".into(),
+            },
+        );
+        feed(&mut ctx, StreamEvent::ContentDelta("hi".into()));
+        feed(&mut ctx, StreamEvent::Finish(CanonicalFinishReason::Stop));
+        let mut usage = Usage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(8),
+            total_tokens: Some(128),
+            extra: Default::default(),
+        };
+        // OpenAI surfaces cache hits under prompt_tokens_details.cached_tokens.
+        usage.extra.insert(
+            "prompt_tokens_details".into(),
+            json!({ "cached_tokens": 100 }),
+        );
+        feed(&mut ctx, StreamEvent::Usage(usage));
+
+        let frames = stream_event_to_anthropic_sse(&StreamEvent::Done, &mut ctx);
+        let delta = frames.iter().find(|f| f.event == "message_delta").unwrap();
+        let v = data(delta);
+        assert_eq!(v["usage"]["input_tokens"], 120);
+        assert_eq!(v["usage"]["output_tokens"], 8);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 100);
     }
 
     #[test]

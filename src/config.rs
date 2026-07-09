@@ -7,7 +7,7 @@
 //! [upstream]
 //! base_url = "https://api.openai.com/v1"
 //! api_key  = "sk-..."
-//! wire     = "openai-chat"        # or "openai-responses" (not yet supported)
+//! wire     = "openai-chat"        # "openai-chat" (default) or "openai-responses"
 //!
 //! # optional: map inbound Anthropic model names onto upstream model names
 //! [upstream.models]
@@ -16,6 +16,7 @@
 //! # optional: fall back to this upstream model when no mapping matches
 //! # default_model = "gpt-4.1"
 //! # timeout_seconds = 600
+//! # proxy = "http://127.0.0.1:8888"   # route upstream traffic via a proxy
 //! # [upstream.default_headers]
 //! # x-custom = "value"
 //! ```
@@ -89,6 +90,12 @@ pub struct UpstreamConfig {
     /// unset, the inbound model name is forwarded unchanged.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Optional proxy for upstream requests (e.g. `"http://127.0.0.1:8888"` or
+    /// `"socks5://host:1080"`). When set, all upstream traffic goes through it.
+    /// When unset, the gateway connects directly, bypassing any ambient system
+    /// proxy — the right default for a loopback sidecar reaching a local model.
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 impl UpstreamConfig {
@@ -113,6 +120,7 @@ impl Debug for UpstreamConfig {
             .field("default_headers", &self.default_headers)
             .field("models", &self.models)
             .field("default_model", &self.default_model)
+            .field("proxy", &self.proxy)
             .finish()
     }
 }
@@ -124,7 +132,7 @@ pub enum Wire {
     /// OpenAI Chat Completions (`POST /chat/completions`).
     #[default]
     OpenaiChat,
-    /// OpenAI Responses API (`POST /responses`). Not yet implemented.
+    /// OpenAI Responses API (`POST /responses`).
     OpenaiResponses,
 }
 
@@ -206,6 +214,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.upstream.resolve_model("some-model"), "some-model");
+    }
+
+    #[test]
+    fn proxy_defaults_to_none_and_parses_when_set() {
+        let none = GatewayConfig::from_toml_str(
+            r#"
+            [upstream]
+            base_url = "http://localhost:8000/v1"
+            api_key = "none"
+            "#,
+        )
+        .unwrap();
+        assert!(none.upstream.proxy.is_none());
+
+        let set = GatewayConfig::from_toml_str(
+            r#"
+            [upstream]
+            base_url = "http://localhost:8000/v1"
+            api_key = "none"
+            proxy = "http://127.0.0.1:8888"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(set.upstream.proxy.as_deref(), Some("http://127.0.0.1:8888"));
     }
 
     #[test]
