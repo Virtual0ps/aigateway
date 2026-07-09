@@ -279,22 +279,18 @@ fn tool_result_content_to_string(content: Option<ToolResultContent>) -> String {
     match content {
         None => String::new(),
         Some(ToolResultContent::Text(s)) => s,
-        Some(ToolResultContent::Blocks(blocks)) => {
-            let texts: Vec<&str> = blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Typed(TypedContentBlock::Text { text, .. }) => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if texts.is_empty() {
-                serde_json::to_string(&blocks).unwrap_or_default()
-            } else {
-                texts.join("\n")
-            }
-        }
+        Some(ToolResultContent::Blocks(blocks)) => blocks
+            .iter()
+            .map(|b| match b {
+                ContentBlock::Typed(TypedContentBlock::Text { text, .. }) => text.clone(),
+                // The OpenAI tool role carries only text — an image tool result
+                // (e.g. Claude Code's Read on an image) can't be forwarded, so
+                // emit a clean placeholder rather than raw JSON.
+                ContentBlock::Typed(TypedContentBlock::Image { .. }) => "[image]".to_owned(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -1068,6 +1064,43 @@ mod tests {
         assert!(matches!(
             &canonical.messages[1].content,
             Some(MessageContent::Text(s)) if s == "thanks"
+        ));
+    }
+
+    #[test]
+    fn tool_result_with_image_block_uses_placeholder() {
+        let req = MessagesRequest::builder()
+            .model("m")
+            .max_tokens(64)
+            .messages(vec![AnthropicMessage {
+                role: AnthropicRole::User,
+                content: AnthropicContent::Blocks(vec![ContentBlock::Typed(
+                    TypedContentBlock::ToolResult {
+                        tool_use_id: "toolu_1".to_owned(),
+                        content: Some(ToolResultContent::Blocks(vec![
+                            ContentBlock::Typed(TypedContentBlock::Text {
+                                text: "see image:".to_owned(),
+                                cache_control: None,
+                            }),
+                            ContentBlock::Typed(TypedContentBlock::Image {
+                                source: ImageSource::Base64 {
+                                    media_type: "image/png".to_owned(),
+                                    data: "aW1n".to_owned(),
+                                },
+                                cache_control: None,
+                            }),
+                        ])),
+                        is_error: None,
+                        cache_control: None,
+                    },
+                )]),
+            }])
+            .build();
+        let canonical = messages_request_to_canonical(req).unwrap();
+        assert_eq!(canonical.messages[0].role, Role::Tool);
+        assert!(matches!(
+            &canonical.messages[0].content,
+            Some(MessageContent::Text(s)) if s == "see image:\n[image]"
         ));
     }
 
