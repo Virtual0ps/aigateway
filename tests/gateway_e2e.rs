@@ -241,6 +241,9 @@ async fn streaming_with_tools_produces_anthropic_sse() {
         "unexpected frame sequence: {names:?}"
     );
 
+    // message_start echoes the requested Anthropic model, not the upstream's.
+    assert_eq!(frames[0].1["message"]["model"], "claude-sonnet-4-20250514");
+
     // Text block.
     assert_eq!(frames[1].1["content_block"]["type"], "text");
     assert_eq!(frames[2].1["delta"]["text"], "Hello");
@@ -292,7 +295,8 @@ async fn unary_produces_anthropic_message() {
     assert_eq!(v["stop_reason"], "end_turn");
     assert_eq!(v["usage"]["input_tokens"], 8);
     assert_eq!(v["usage"]["output_tokens"], 4);
-    assert_eq!(v["model"], "gpt-4.1");
+    // The response echoes the requested Anthropic model, not the upstream's.
+    assert_eq!(v["model"], "claude-sonnet-4-20250514");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

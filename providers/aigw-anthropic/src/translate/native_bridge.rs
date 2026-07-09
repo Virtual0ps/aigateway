@@ -623,6 +623,9 @@ pub struct SseContext {
     pub model: String,
     /// Message id surfaced in `message_start` (from the first `ResponseMeta`).
     pub message_id: String,
+    /// When `true`, `ResponseMeta` won't overwrite `model` — used to echo the
+    /// client's requested model rather than the upstream's.
+    model_pinned: bool,
     started: bool,
     stopped: bool,
     next_index: usize,
@@ -634,11 +637,24 @@ pub struct SseContext {
 
 impl SseContext {
     /// Build a context with a fixed fallback model name, used when the
-    /// canonical stream's `ResponseMeta` doesn't carry one.
+    /// canonical stream's `ResponseMeta` doesn't carry one. `ResponseMeta` may
+    /// still overwrite it with the upstream model.
     #[must_use]
     pub fn with_model(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a context whose model is **pinned** — surfaced in `message_start`
+    /// and never overwritten by `ResponseMeta`. Use to echo the client's
+    /// requested model instead of the upstream's.
+    #[must_use]
+    pub fn with_pinned_model(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+            model_pinned: true,
             ..Default::default()
         }
     }
@@ -813,7 +829,7 @@ pub fn stream_event_to_anthropic_sse(
     match event {
         StreamEvent::ResponseMeta { id, model } => {
             ctx.message_id = id.clone();
-            if !model.is_empty() {
+            if !ctx.model_pinned && !model.is_empty() {
                 ctx.model = model.clone();
             }
             ctx.ensure_started(&mut out);
@@ -1271,6 +1287,21 @@ mod tests {
         let v = data(&frames[0]);
         assert_eq!(v["message"]["id"], "msg_1");
         assert_eq!(v["message"]["model"], "gpt-4.1");
+    }
+
+    #[test]
+    fn pinned_model_survives_response_meta() {
+        let mut ctx = SseContext::with_pinned_model("claude-sonnet-4-5");
+        let frames = stream_event_to_anthropic_sse(
+            &StreamEvent::ResponseMeta {
+                id: "resp_1".into(),
+                model: "gpt-4.1".into(),
+            },
+            &mut ctx,
+        );
+        // message_start keeps the pinned model, and takes the upstream message id.
+        assert_eq!(data(&frames[0])["message"]["model"], "claude-sonnet-4-5");
+        assert_eq!(data(&frames[0])["message"]["id"], "resp_1");
     }
 
     #[test]

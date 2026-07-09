@@ -124,14 +124,17 @@ impl Upstream {
                 );
             }
         };
+        // Echo the client's requested model back in the response, not the
+        // upstream's — Claude Code keys behavior on the model name.
+        let requested_model = canonical.model.clone();
         canonical.model = self.config.resolve_model(&canonical.model);
         // Let the chosen translate method own the `stream` flag.
         canonical.stream = None;
 
         if streaming {
-            self.handle_streaming(&canonical).await
+            self.handle_streaming(&canonical, &requested_model).await
         } else {
-            self.handle_unary(&canonical).await
+            self.handle_unary(&canonical, &requested_model).await
         }
     }
 
@@ -141,7 +144,7 @@ impl Upstream {
         self.config.models.keys().cloned().collect()
     }
 
-    async fn handle_unary(&self, canonical: &ChatRequest) -> Response {
+    async fn handle_unary(&self, canonical: &ChatRequest, requested_model: &str) -> Response {
         let translated = match self.request.translate_request(canonical) {
             Ok(t) => t,
             Err(e) => {
@@ -179,12 +182,15 @@ impl Upstream {
             }
         };
         match chat_response_to_messages(chat) {
-            Ok(messages) => (StatusCode::OK, Json(messages)).into_response(),
+            Ok(mut messages) => {
+                messages.model = requested_model.to_owned();
+                (StatusCode::OK, Json(messages)).into_response()
+            }
             Err(e) => anthropic_error(StatusCode::BAD_GATEWAY, "api_error", &e.to_string()),
         }
     }
 
-    async fn handle_streaming(&self, canonical: &ChatRequest) -> Response {
+    async fn handle_streaming(&self, canonical: &ChatRequest, requested_model: &str) -> Response {
         let translated = match self.request.translate_stream_request(canonical) {
             Ok(t) => t,
             Err(e) => {
@@ -208,7 +214,7 @@ impl Upstream {
         }
 
         let parser = self.response.stream_parser();
-        let ctx = NativeSseContext::with_model(canonical.model.clone());
+        let ctx = NativeSseContext::with_pinned_model(requested_model);
         let byte_stream = resp.bytes_stream();
         let sse = anthropic_sse_stream(byte_stream, parser, ctx);
 

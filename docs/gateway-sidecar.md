@@ -146,8 +146,9 @@ bind loopback; do not expose this endpoint to a network.
   counts — plus `cache_read_input_tokens` when the upstream reports cache hits —
   arrive in the terminal `message_delta.usage`, which Claude Code reads. Unary
   responses carry full usage directly.
-- **Response `model`** — the response echoes the upstream model name (what
-  actually served the request), not the requested Anthropic model name.
+- **Response `model`** — the response echoes the client's requested Anthropic
+  model name (so Claude Code's model-based logic stays consistent), not the
+  upstream model that actually served it.
 
 ## Example
 
