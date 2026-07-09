@@ -32,12 +32,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-aigw = { workspace = true }
+aigw-anthropic.workspace = true
+aigw-core.workspace = true
+aigw-openai.workspace = true
+aigw-openai-compat.workspace = true
+anyhow = "1.0.103"
+async-stream = "0.3.6"
+axum = "0.8.9"
+bytes = "1.12.1"
+clap = { version = "4.6.1", features = ["derive"] }
+eventsource-stream = "0.2.3"
+futures-util = "0.3"
+http = "1.4.2"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+secrecy = "0.10"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "io-util"] }
+toml = "1.1.2"
 
 [dev-dependencies]
-aigw-core = { workspace = true }
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false }
-secrecy = "0.10"
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# The umbrella crate is used only by the live OAuth E2E suite (tests/oauth_e2e.rs).
+aigw = { workspace = true }
