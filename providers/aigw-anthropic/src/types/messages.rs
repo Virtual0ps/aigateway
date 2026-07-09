@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 ///     .temperature(0.7)
 ///     .build();
 /// ```
-#[derive(Debug, Clone, Builder, Serialize)]
+#[derive(Debug, Clone, Builder, Serialize, Deserialize)]
 #[builder(on(String, into))]
 pub struct MessagesRequest {
     /// Model identifier (e.g. `"claude-sonnet-4-20250514"`).
@@ -36,34 +36,34 @@ pub struct MessagesRequest {
     pub max_tokens: u64,
 
     /// System prompt, separate from messages (Anthropic has no `role: "system"`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system: Option<SystemPrompt>,
     /// Sampling temperature (0.0–1.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     /// Nucleus sampling parameter.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
     /// Top-K sampling parameter.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     /// Custom stop sequences.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     /// Enable SSE streaming.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     /// Available tools for the model.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
     /// Tool selection strategy.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     /// Request metadata (e.g. `user_id`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Metadata>,
     /// Extended thinking configuration.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
 
     /// Provider-specific fields that we don't interpret.
@@ -340,7 +340,7 @@ pub enum ThinkingConfig {
 // ─── Response ────────────────────────────────────────────────────────────────
 
 /// POST `/v1/messages` response body (non-streaming).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesResponse {
     /// Unique message ID (e.g. `"msg_01XFDUDYJgAACzvnptvVoYEL"`).
     pub id: String,
