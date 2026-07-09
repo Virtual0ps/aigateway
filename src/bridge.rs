@@ -15,7 +15,10 @@ use aigw_anthropic::translate::{
 };
 use aigw_anthropic::types::MessagesRequest;
 use aigw_core::error::ProviderError;
-use aigw_core::translate::{RequestTranslator, ResponseTranslator, TranslatedRequest};
+use aigw_core::model::{ChatRequest, StreamEvent};
+use aigw_core::translate::{
+    RequestTranslator, ResponseTranslator, StreamParser, TranslatedRequest,
+};
 use aigw_openai::translate::OpenAIResponseTranslator;
 use aigw_openai::{DEFAULT_TIMEOUT_SECONDS, HttpTransportConfig, OpenAIAuthConfig};
 use aigw_openai_compat::translate::OpenAICompatRequestTranslator;
@@ -128,7 +131,7 @@ impl Upstream {
         }
     }
 
-    async fn handle_unary(&self, canonical: &aigw_core::model::ChatRequest) -> Response {
+    async fn handle_unary(&self, canonical: &ChatRequest) -> Response {
         let translated = match self.request.translate_request(canonical) {
             Ok(t) => t,
             Err(e) => {
@@ -171,7 +174,7 @@ impl Upstream {
         }
     }
 
-    async fn handle_streaming(&self, canonical: &aigw_core::model::ChatRequest) -> Response {
+    async fn handle_streaming(&self, canonical: &ChatRequest) -> Response {
         let translated = match self.request.translate_stream_request(canonical) {
             Ok(t) => t,
             Err(e) => {
@@ -226,11 +229,9 @@ impl Upstream {
 /// Transform an upstream OpenAI SSE byte stream into an Anthropic SSE byte
 /// stream, driving the canonical [`StreamParser`] and the block-lifecycle
 /// [`NativeSseContext`] statefully.
-///
-/// [`StreamParser`]: aigw_core::translate::StreamParser
 fn anthropic_sse_stream(
     byte_stream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
-    mut parser: Box<dyn aigw_core::translate::StreamParser>,
+    mut parser: Box<dyn StreamParser>,
     mut ctx: NativeSseContext,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
@@ -260,14 +261,20 @@ fn anthropic_sse_stream(
                 }
             }
         }
-        // Flush any buffered tail events (e.g. a synthesized Done if the
-        // upstream closed without an explicit [DONE]).
+        // Flush any events the parser buffered for end-of-stream.
         if let Ok(tail) = parser.finish() {
             for cev in &tail {
                 for frame in stream_event_to_anthropic_sse(cev, &mut ctx) {
                     yield Ok(Bytes::from(frame.to_sse_bytes()));
                 }
             }
+        }
+        // Safety net: guarantee a terminal `message_delta` + `message_stop`
+        // even if the upstream closed without a `[DONE]` sentinel (some
+        // providers just close the socket). Idempotent — a no-op if the stream
+        // already emitted `message_stop`.
+        for frame in stream_event_to_anthropic_sse(&StreamEvent::Done, &mut ctx) {
+            yield Ok(Bytes::from(frame.to_sse_bytes()));
         }
     }
 }

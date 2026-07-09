@@ -28,6 +28,12 @@ struct Recorded {
 
 type Recorder = Arc<Mutex<Recorded>>;
 
+/// Mock upstream state: what to record, and the SSE body to serve for streaming.
+struct MockState {
+    recorder: Recorder,
+    stream_body: &'static str,
+}
+
 const STREAM_SSE: &str = concat!(
     "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
@@ -39,16 +45,20 @@ const STREAM_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
+/// A stream that ends after a content delta with no finish chunk and no
+/// `[DONE]` sentinel — the socket just closes.
+const STREAM_SSE_NO_DONE: &str = "data: {\"id\":\"chatcmpl-mock\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"gpt-4.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n";
+
 const UNARY_JSON: &str = r#"{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"gpt-4.1","choices":[{"index":0,"message":{"role":"assistant","content":"Hi there!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}"#;
 
 async fn chat_completions(
-    State(recorder): State<Recorder>,
+    State(state): State<Arc<MockState>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let v: Value = serde_json::from_slice(&body).expect("upstream body is JSON");
     {
-        let mut rec = recorder.lock().unwrap();
+        let mut rec = state.recorder.lock().unwrap();
         rec.model = v["model"].as_str().map(str::to_owned);
         rec.authorization = headers
             .get(header::AUTHORIZATION)
@@ -57,20 +67,28 @@ async fn chat_completions(
     }
 
     if v["stream"].as_bool().unwrap_or(false) {
-        ([(header::CONTENT_TYPE, "text/event-stream")], STREAM_SSE).into_response()
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            state.stream_body,
+        )
+            .into_response()
     } else {
         ([(header::CONTENT_TYPE, "application/json")], UNARY_JSON).into_response()
     }
 }
 
-/// Bind a mock OpenAI-compatible upstream on loopback. Returns its base URL
-/// (with the `/v1` prefix the gateway appends `/chat/completions` to) and the
-/// request recorder.
-async fn spawn_mock_upstream() -> (String, Recorder) {
+/// Bind a mock OpenAI-compatible upstream on loopback, serving `stream_body`
+/// for streaming requests. Returns its base URL (with the `/v1` prefix the
+/// gateway appends `/chat/completions` to) and the request recorder.
+async fn spawn_mock_upstream(stream_body: &'static str) -> (String, Recorder) {
     let recorder: Recorder = Arc::new(Mutex::new(Recorded::default()));
+    let state = Arc::new(MockState {
+        recorder: recorder.clone(),
+        stream_body,
+    });
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
-        .with_state(recorder.clone());
+        .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -131,7 +149,7 @@ fn client() -> reqwest::Client {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_with_tools_produces_anthropic_sse() {
-    let (upstream_base, recorder) = spawn_mock_upstream().await;
+    let (upstream_base, recorder) = spawn_mock_upstream(STREAM_SSE).await;
     let gateway = spawn_gateway(upstream_base).await;
 
     let body = serde_json::json!({
@@ -209,7 +227,7 @@ async fn streaming_with_tools_produces_anthropic_sse() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unary_produces_anthropic_message() {
-    let (upstream_base, _recorder) = spawn_mock_upstream().await;
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
     let gateway = spawn_gateway(upstream_base).await;
 
     let body = serde_json::json!({
@@ -238,8 +256,50 @@ async fn unary_produces_anthropic_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_without_done_still_terminates() {
+    // Upstream closes after a content delta with no finish chunk and no
+    // `[DONE]`. The gateway must still emit a terminal message_delta +
+    // message_stop so the client doesn't hang.
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE_NO_DONE).await;
+    let gateway = spawn_gateway(upstream_base).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+
+    let resp = client()
+        .post(format!("{gateway}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let text = resp.text().await.unwrap();
+    let frames = parse_sse(&text);
+    let names: Vec<&str> = frames.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "message_start",
+            "content_block_start",
+            "content_block_delta",
+            "content_block_stop",
+            "message_delta",
+            "message_stop",
+        ],
+        "stream without [DONE] must still be closed by the gateway: {names:?}"
+    );
+    // Default stop reason when the upstream never reported one.
+    assert_eq!(frames[4].1["delta"]["stop_reason"], "end_turn");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_check_ok() {
-    let (upstream_base, _recorder) = spawn_mock_upstream().await;
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
     let gateway = spawn_gateway(upstream_base).await;
 
     let resp = client()
