@@ -39,6 +39,10 @@ use serde_json::json;
 
 use crate::config::{UpstreamConfig, Wire};
 
+/// Idle gap after which a keepalive `ping` SSE event is emitted during
+/// streaming. Well under typical client/proxy idle timeouts.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+
 /// A configured upstream: the translators, HTTP client, and model mapping
 /// needed to serve one inbound Anthropic request against one OpenAI-compatible
 /// backend. Cheap to share behind an `Arc`.
@@ -268,13 +272,28 @@ fn anthropic_sse_stream(
         // `eventsource()` needs an `Unpin` stream; reqwest's `bytes_stream()`
         // is not, so pin it on the heap.
         let mut events = Box::pin(byte_stream).eventsource();
-        while let Some(item) = events.next().await {
-            let event = match item {
-                Ok(event) => event,
-                // Upstream transport dropped mid-stream — surface it and stop.
-                Err(e) => {
-                    yield Ok(error_sse_bytes(&e.to_string()));
-                    return;
+        // Keepalive: emit an Anthropic `ping` after each idle gap so a slow or
+        // local upstream doesn't idle-timeout the client before the first
+        // token. The interval resets on every upstream event, so pings only
+        // fire during genuine silence.
+        let mut keepalive = tokio::time::interval(PING_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        keepalive.tick().await; // consume the immediate first tick
+        loop {
+            let event = tokio::select! {
+                biased;
+                item = events.next() => match item {
+                    None => break,
+                    Some(Ok(event)) => event,
+                    // Upstream transport dropped mid-stream — surface it and stop.
+                    Some(Err(e)) => {
+                        yield Ok(error_sse_bytes(&e.to_string()));
+                        return;
+                    }
+                },
+                _ = keepalive.tick() => {
+                    yield Ok(Bytes::from_static(b"event: ping\ndata: {\"type\":\"ping\"}\n\n"));
+                    continue;
                 }
             };
             match parser.parse_event("", &event.data) {
@@ -290,6 +309,7 @@ fn anthropic_sse_stream(
                     return;
                 }
             }
+            keepalive.reset(); // pings only after genuine idle
         }
         // Flush any events the parser buffered for end-of-stream.
         if let Ok(tail) = parser.finish() {

@@ -124,6 +124,9 @@ bind loopback; do not expose this endpoint to a network.
 
 ## Behavior notes
 
+- **Keepalive** — during streaming the gateway emits an Anthropic `ping` event
+  after each idle gap (~15s of upstream silence), so a slow or local upstream
+  doesn't idle-timeout the client before the first token.
 - **Networking** — by default the outbound HTTP client bypasses the system
   proxy, so a loopback sidecar talks directly to its configured upstream
   (important for `localhost` model servers). Set `upstream.proxy` to route
