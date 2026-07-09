@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+  # Provides the stable Rust toolchain (rustc/cargo/clippy/rustfmt/rust-analyzer)
+  # used by languages.rust with channel = "stable".
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
