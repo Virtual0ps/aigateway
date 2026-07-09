@@ -57,3 +57,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 # The umbrella crate is used only by the live OAuth E2E suite (tests/oauth_e2e.rs).
 aigw = { workspace = true }
+
+# Strip symbols from release builds → smaller distributed binaries.
+[profile.release]
+strip = true

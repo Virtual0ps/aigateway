@@ -1,0 +1,171 @@
+name: Release binaries
+
+# Builds per-platform `aigateway` binaries and attaches them (plus checksums)
+# to the GitHub Release for a `v<version>` tag. release-plz creates that tag +
+# release on merge to master; the multi-target build takes minutes, so this
+# runs after the release exists and appends assets to it. Can also be run
+# manually against an existing tag via workflow_dispatch.
+#
+# Asset naming (LinkCode / tectonic convention):
+#   unix: aigateway-<version>-<triple>.tar.gz   (member: `aigateway`)
+#   win:  aigateway-<version>-<triple>.zip      (member: `aigateway.exe`)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release for (e.g. v0.5.1)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  BIN: aigateway
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PLATFORM_KEYS aligned with LinkCode.
+          - platform: darwin-arm64
+            target: aarch64-apple-darwin
+            os: macos-14
+            ext: tar.gz
+          - platform: darwin-x64
+            target: x86_64-apple-darwin
+            os: macos-13
+            ext: tar.gz
+          - platform: linux-arm64
+            target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: tar.gz
+            cross: true
+          - platform: linux-x64
+            target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            ext: tar.gz
+            cross: true
+          - platform: win32-x64
+            target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version and asset name
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"; VERSION="${VERSION#aigateway@}"
+          ASSET="${BIN}-${VERSION}-${{ matrix.target }}.${{ matrix.ext }}"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "asset=$ASSET"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cargo)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --bin "${{ env.BIN }}" --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --locked --bin "${{ env.BIN }}" --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: ${{ matrix.ext == 'tar.gz' }}
+        shell: bash
+        run: tar -czf "${{ steps.meta.outputs.asset }}" -C "target/${{ matrix.target }}/release" "${{ env.BIN }}"
+
+      - name: Package (zip)
+        if: ${{ matrix.ext == 'zip' }}
+        shell: pwsh
+        run: Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BIN }}.exe" -DestinationPath "${{ steps.meta.outputs.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.asset }}
+          path: ${{ steps.meta.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and SRI notes
+        shell: bash
+        working-directory: dist
+        run: |
+          sha256sum ${BIN}-* > SHA256SUMS
+          {
+            echo "### Binaries"
+            echo
+            echo "SHA-256 (hex) and Subresource Integrity (\`sha256-<base64>\`, for LinkCode catalogs):"
+            echo
+            echo "| asset | sha256 | SRI |"
+            echo "| --- | --- | --- |"
+            for f in ${BIN}-*.tar.gz ${BIN}-*.zip; do
+              [ -e "$f" ] || continue
+              hex="$(sha256sum "$f" | awk '{print $1}')"
+              sri="sha256-$(openssl dgst -sha256 -binary "$f" | base64 -w0)"
+              echo "| \`$f\` | \`$hex\` | \`$sri\` |"
+            done
+          } > NOTES.md
+          cat NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          body_path: dist/NOTES.md
+          append_body: true
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(steps.meta.outputs.tag, '-') }}
+          files: |
+            dist/${{ env.BIN }}-*.tar.gz
+            dist/${{ env.BIN }}-*.zip
+            dist/SHA256SUMS
