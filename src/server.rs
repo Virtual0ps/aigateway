@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
@@ -17,6 +17,11 @@ use http::StatusCode;
 use serde_json::json;
 
 use crate::bridge::Upstream;
+
+/// Inbound request body cap. Claude Code sends large histories (long
+/// transcripts, tool results, base64 images), so the default 2 MB `Bytes`
+/// limit is far too small; 64 MiB is generous for a trusted loopback sidecar.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shared application state handed to every request handler.
 #[derive(Clone)]
@@ -40,6 +45,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/messages", post(messages_handler))
         .route("/health", get(health_handler))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
