@@ -22,6 +22,10 @@ aigateway serve --host 127.0.0.1 --port 0 --config <path>
 | `--host`   | `127.0.0.1` | Bind address. Keep on loopback.                            |
 | `--port`   | `0`         | Bind port. `0` lets the OS assign a free port.             |
 | `--config` | *(required)*| Path to the TOML config file.                             |
+| `--log-level` | `info`   | Log level (`error`/`warn`/`info`/`debug`/`trace`). `RUST_LOG` overrides. |
+
+Structured logs go to **stderr** (ANSI colors only on a tty); the `listening
+on …` line is the **only** thing on stdout, so a daemon can parse it cleanly.
 
 On successful bind — **before** serving — the process prints exactly one line to
 **stdout** and flushes it:

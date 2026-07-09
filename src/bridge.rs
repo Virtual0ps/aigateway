@@ -395,6 +395,7 @@ pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, message: &str)
 }
 
 fn upstream_unreachable(err: &reqwest::Error) -> Response {
+    tracing::warn!(error = %err, "upstream request failed");
     anthropic_error(
         StatusCode::BAD_GATEWAY,
         "api_error",
@@ -404,6 +405,7 @@ fn upstream_unreachable(err: &reqwest::Error) -> Response {
 
 /// Map a canonical [`ProviderError`] onto an Anthropic-shaped HTTP error.
 fn provider_error(err: ProviderError) -> Response {
+    tracing::warn!(error = %err, "upstream returned an error");
     let (status, err_type) = match &err {
         ProviderError::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
         ProviderError::AuthenticationFailed { .. } => {

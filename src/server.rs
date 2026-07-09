@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
         .route("/v1/models", get(models_handler))
         .route("/health", get(health_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

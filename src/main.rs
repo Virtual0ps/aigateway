@@ -46,6 +46,23 @@ struct ServeArgs {
     /// Path to the TOML config file.
     #[arg(long)]
     config: PathBuf,
+    /// Log level (`error`/`warn`/`info`/`debug`/`trace`). `RUST_LOG` overrides.
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+/// Initialize structured logging to stderr. `RUST_LOG` (if set) wins over
+/// `--log-level`; the `listening on …` line stays on stdout for the daemon.
+fn init_tracing(level: &str) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        // Plain output when stderr is captured (daemon logs); colors only on a tty.
+        .with_ansi(std::io::stderr().is_terminal())
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 #[tokio::main]
@@ -57,8 +74,15 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    init_tracing(&args.log_level);
+
     let config = GatewayConfig::load(&args.config)
         .with_context(|| format!("loading config {}", args.config.display()))?;
+    tracing::info!(
+        base_url = %config.upstream.base_url,
+        wire = ?config.upstream.wire,
+        "upstream configured"
+    );
     let upstream = Upstream::new(config.upstream)?;
     let state = AppState::new(upstream);
 
@@ -74,6 +98,7 @@ async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
     // OS-assigned port when `--port 0`) and flush so it's readable immediately.
     println!("listening on http://{local_addr}");
     std::io::stdout().flush().context("flushing stdout")?;
+    tracing::info!(%local_addr, "gateway listening");
 
     serve(listener, state).await
 }
