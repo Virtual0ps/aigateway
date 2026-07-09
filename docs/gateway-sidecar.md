@@ -70,6 +70,14 @@ default_model = "gpt-4.1"
 # Optional: extra headers sent on every upstream request.
 [upstream.default_headers]
 x-custom-header = "value"
+
+# Optional: openai-chat capability flags. Defaults are all-true; set false to
+# strip fields a limited/local upstream rejects.
+[upstream.quirks]
+supports_tool_choice = true
+supports_parallel_tool_calls = true
+supports_vision = true
+supports_streaming = true
 ```
 
 | Field                    | Required | Notes                                                             |
@@ -82,6 +90,7 @@ x-custom-header = "value"
 | `upstream.default_model` | no       | Fallback upstream model; passthrough if unset.                   |
 | `upstream.proxy`         | no       | Proxy URL for upstream traffic; direct (bypasses system proxy) if unset. |
 | `upstream.default_headers` | no     | Extra upstream request headers.                                  |
+| `upstream.quirks`        | no       | `openai-chat` capability flags; strips unsupported fields for limited upstreams. |
 
 ## Endpoints
 

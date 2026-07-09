@@ -80,7 +80,7 @@ impl Upstream {
                         name: "upstream".to_owned(),
                         http,
                         auth,
-                        quirks: Default::default(),
+                        quirks: config.quirks.clone(),
                     })
                     .map_err(|e| anyhow::anyhow!("invalid upstream config: {e}"))?;
                     let request = OpenAICompatRequestTranslator::new(&provider)

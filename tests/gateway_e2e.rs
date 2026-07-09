@@ -147,6 +147,7 @@ async fn spawn_gateway(upstream_base: String, wire: Wire) -> String {
         models: BTreeMap::from([("claude-sonnet-4-20250514".to_owned(), "gpt-4.1".to_owned())]),
         default_model: None,
         proxy: None,
+        quirks: Default::default(),
     };
     let upstream = Upstream::new(config).unwrap();
     let state = AppState::new(upstream);

@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::path::Path;
 
+use aigw_openai_compat::Quirks;
 use secrecy::SecretString;
 use serde::Deserialize;
 use serde::de::Deserializer;
@@ -96,6 +97,11 @@ pub struct UpstreamConfig {
     /// proxy — the right default for a loopback sidecar reaching a local model.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// OpenAI-compatible capability flags (`openai-chat` wire only). Unsupported
+    /// fields are stripped before forwarding — set these for local or limited
+    /// upstreams that reject e.g. `tool_choice` or `parallel_tool_calls`.
+    #[serde(default)]
+    pub quirks: Quirks,
 }
 
 impl UpstreamConfig {
@@ -121,6 +127,7 @@ impl Debug for UpstreamConfig {
             .field("models", &self.models)
             .field("default_model", &self.default_model)
             .field("proxy", &self.proxy)
+            .field("quirks", &self.quirks)
             .finish()
     }
 }
@@ -238,6 +245,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set.upstream.proxy.as_deref(), Some("http://127.0.0.1:8888"));
+    }
+
+    #[test]
+    fn quirks_default_and_override() {
+        let dflt = GatewayConfig::from_toml_str(
+            r#"
+            [upstream]
+            base_url = "http://localhost:8000/v1"
+            api_key = "none"
+            "#,
+        )
+        .unwrap();
+        assert!(dflt.upstream.quirks.supports_streaming);
+        assert!(dflt.upstream.quirks.supports_tool_choice);
+
+        let overridden = GatewayConfig::from_toml_str(
+            r#"
+            [upstream]
+            base_url = "http://localhost:8000/v1"
+            api_key = "none"
+
+            [upstream.quirks]
+            supports_tool_choice = false
+            supports_parallel_tool_calls = false
+            "#,
+        )
+        .unwrap();
+        assert!(!overridden.upstream.quirks.supports_tool_choice);
+        assert!(!overridden.upstream.quirks.supports_parallel_tool_calls);
+        assert!(overridden.upstream.quirks.supports_streaming);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod config;
 pub mod server;
 
+pub use aigw_openai_compat::Quirks;
 pub use bridge::Upstream;
 pub use config::{GatewayConfig, UpstreamConfig, Wire};
 pub use server::{AppState, router, serve};
