@@ -422,6 +422,45 @@ async fn responses_unary_produces_anthropic_message() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn models_endpoint_lists_configured_models() {
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
+
+    let resp = client()
+        .get(format!("{gateway}/v1/models"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["has_more"], false);
+    assert_eq!(v["data"][0]["type"], "model");
+    assert_eq!(v["data"][0]["id"], "claude-sonnet-4-20250514");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_tokens_returns_estimate() {
+    let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
+    let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;
+
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 64,
+        "messages": [{ "role": "user", "content": "The quick brown fox jumps over the lazy dog." }]
+    });
+    let resp = client()
+        .post(format!("{gateway}/v1/messages/count_tokens"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    let n = v["input_tokens"].as_u64().unwrap();
+    assert!((5..=20).contains(&n), "estimate out of expected range: {n}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_check_ok() {
     let (upstream_base, _recorder) = spawn_mock_upstream(STREAM_SSE).await;
     let gateway = spawn_gateway(upstream_base, Wire::OpenaiChat).await;

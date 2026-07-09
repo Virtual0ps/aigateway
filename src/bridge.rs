@@ -15,7 +15,7 @@ use aigw_anthropic::translate::{
 };
 use aigw_anthropic::types::MessagesRequest;
 use aigw_core::error::ProviderError;
-use aigw_core::model::{ChatRequest, StreamEvent};
+use aigw_core::model::{ChatRequest, Message, StreamEvent};
 use aigw_core::translate::{
     RequestTranslator, ResponseTranslator, StreamParser, TranslatedRequest,
 };
@@ -129,6 +129,12 @@ impl Upstream {
         } else {
             self.handle_unary(&canonical).await
         }
+    }
+
+    /// The inbound Anthropic model names the gateway advertises on
+    /// `GET /v1/models` — the configured `[upstream.models]` keys.
+    pub fn advertised_models(&self) -> Vec<String> {
+        self.config.models.keys().cloned().collect()
     }
 
     async fn handle_unary(&self, canonical: &ChatRequest) -> Response {
@@ -311,8 +317,50 @@ fn error_sse_bytes(message: &str) -> Bytes {
     Bytes::from(format!("event: error\ndata: {data}\n\n"))
 }
 
+/// Heuristic input-token estimate for `POST /v1/messages/count_tokens`.
+///
+/// OpenAI-compatible upstreams have no token-count endpoint, so this is a rough
+/// `~chars/4` estimate over message text, tool-call arguments, and tool schemas.
+/// It is **advisory** — Claude Code uses it for the context indicator and
+/// degrades gracefully when it's imprecise.
+pub(crate) fn estimate_input_tokens(req: &MessagesRequest) -> u64 {
+    let Ok(canonical) = messages_request_to_canonical(req.clone()) else {
+        return 0;
+    };
+    let mut chars: usize = canonical.messages.iter().map(message_text_len).sum();
+    for tool in canonical.tools.iter().flatten() {
+        chars += tool.function.name.len();
+        chars += tool.function.description.as_deref().map_or(0, str::len);
+        if let Some(params) = &tool.function.parameters {
+            chars += params.to_string().len();
+        }
+    }
+    // ~4 chars per token, rounded up.
+    chars.div_ceil(4) as u64
+}
+
+fn message_text_len(msg: &Message) -> usize {
+    use aigw_core::model::{ContentPart, MessageContent, TypedContentPart};
+    let mut len = 0;
+    match &msg.content {
+        Some(MessageContent::Text(s)) => len += s.len(),
+        Some(MessageContent::Parts(parts)) => {
+            for part in parts {
+                if let ContentPart::Known(TypedContentPart::Text { text, .. }) = part {
+                    len += text.len();
+                }
+            }
+        }
+        None => {}
+    }
+    for tc in msg.tool_calls.iter().flatten() {
+        len += tc.function.name.len() + tc.function.arguments.len();
+    }
+    len
+}
+
 /// Build an Anthropic-shaped error response body with the given status.
-fn anthropic_error(status: StatusCode, err_type: &str, message: &str) -> Response {
+pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, message: &str) -> Response {
     let body = json!({
         "type": "error",
         "error": { "type": err_type, "message": message },

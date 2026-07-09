@@ -98,6 +98,20 @@ request body. `max_tokens` is required (as upstream Anthropic requires). Honors
   `thinking` blocks (with `signature_delta`) are all emitted.
 - **Unary** returns a JSON Anthropic `message` object.
 
+### `POST /v1/messages/count_tokens`
+
+Anthropic's token-count endpoint. OpenAI upstreams have no equivalent, so this
+returns a **heuristic** estimate (`~chars/4` over text + tool schemas). Advisory
+only — Claude Code uses it for the context indicator and degrades gracefully
+when it's imprecise.
+
+### `GET /v1/models`
+
+Lists the inbound Anthropic model names the gateway accepts — the configured
+`[upstream.models]` keys — in Anthropic's `{"data":[…],"has_more":false}` shape.
+Claude Code probes this at startup, so keep `[upstream.models]` populated with
+the model names you'll request.
+
 ### `GET /health`
 
 Returns `200 {"status":"ok"}`.

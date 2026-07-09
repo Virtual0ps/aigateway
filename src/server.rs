@@ -8,15 +8,16 @@
 
 use std::sync::Arc;
 
+use aigw_anthropic::types::MessagesRequest;
 use axum::Json;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Router, body::Bytes};
 use http::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
 
-use crate::bridge::Upstream;
+use crate::bridge::{Upstream, anthropic_error, estimate_input_tokens};
 
 /// Inbound request body cap. Claude Code sends large histories (long
 /// transcripts, tool results, base64 images), so the default 2 MB `Bytes`
@@ -44,6 +45,8 @@ impl AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/messages", post(messages_handler))
+        .route("/v1/messages/count_tokens", post(count_tokens_handler))
+        .route("/v1/models", get(models_handler))
         .route("/health", get(health_handler))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
@@ -67,20 +70,56 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> anyhow
 /// so parse failures produce an Anthropic-shaped error instead of axum's
 /// default plain-text rejection.
 async fn messages_handler(State(state): State<AppState>, body: Bytes) -> Response {
-    let req = match serde_json::from_slice(&body) {
-        Ok(req) => req,
-        Err(e) => {
-            let err = json!({
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": format!("failed to parse request body: {e}"),
-                },
-            });
-            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
-        }
-    };
-    state.upstream.handle(req).await
+    match serde_json::from_slice(&body) {
+        Ok(req) => state.upstream.handle(req).await,
+        Err(e) => anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("failed to parse request body: {e}"),
+        ),
+    }
+}
+
+/// `POST /v1/messages/count_tokens` — Anthropic's token-count endpoint. Returns
+/// a heuristic estimate since OpenAI upstreams have no equivalent (advisory;
+/// Claude Code degrades gracefully).
+async fn count_tokens_handler(body: Bytes) -> Response {
+    match serde_json::from_slice::<MessagesRequest>(&body) {
+        Ok(req) => Json(json!({ "input_tokens": estimate_input_tokens(&req) })).into_response(),
+        Err(e) => anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            &format!("failed to parse request body: {e}"),
+        ),
+    }
+}
+
+/// `GET /v1/models` — advertise the inbound Anthropic model names the gateway
+/// accepts (the configured `[upstream.models]` keys). Claude Code probes this
+/// at startup.
+async fn models_handler(State(state): State<AppState>) -> Response {
+    let data: Vec<Value> = state
+        .upstream
+        .advertised_models()
+        .into_iter()
+        .map(|id| {
+            json!({
+                "type": "model",
+                "id": id,
+                "display_name": id,
+                "created_at": "2025-01-01T00:00:00Z",
+            })
+        })
+        .collect();
+    let first = data.first().map(|m| m["id"].clone());
+    let last = data.last().map(|m| m["id"].clone());
+    Json(json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    }))
+    .into_response()
 }
 
 /// `GET /health` — a liveness probe for the spawning daemon.
