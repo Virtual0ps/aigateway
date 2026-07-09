@@ -108,6 +108,34 @@ Configure any OpenAI-compatible provider with a `base_url` + `Quirks` capability
 
 > **Adding a new provider?** If the API is OpenAI-compatible, add a `Quirks` config to `aigw-openai-compat`. Only create a new crate for providers with a distinct wire format.
 
+## Run as a gateway sidecar
+
+Beyond the provider libraries, the `aigateway` binary runs as a **loopback
+sidecar** that serves the Anthropic Messages API (`POST /v1/messages`) on top of
+any OpenAI-compatible upstream — so a bare OpenAI/local-model key can back a
+**Claude Code** session offline, with no hosted gateway.
+
+```toml
+# gateway.toml
+[upstream]
+base_url = "https://api.openai.com/v1"
+api_key  = "sk-..."
+
+[upstream.models]
+"claude-sonnet-4-20250514" = "gpt-4.1"
+```
+
+```bash
+aigateway serve --host 127.0.0.1 --port 0 --config gateway.toml
+# → listening on http://127.0.0.1:49157
+
+export ANTHROPIC_BASE_URL="http://127.0.0.1:49157"   # point Claude Code here
+```
+
+Streaming SSE, tool calls, and thinking blocks are translated back to Anthropic
+wire format. See [**docs/gateway-sidecar.md**](docs/gateway-sidecar.md) for the
+full CLI/spawn contract, config schema, and behavior notes.
+
 ## Design Principles
 
 ### No universal message type
